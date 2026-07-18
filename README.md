@@ -18,13 +18,13 @@ species search, saving records, photos, everything.
    prompt. From then on it opens like a native app and works fully offline —
    the first load caches everything it needs (app code + species database).
 3. **New relevé**: capture GPS, fill in plot structure (area, slope, aspect,
-   habitat, layer cover), pick a cover-abundance scale, then search and add
-   species. Search is abbreviation-based — type `dro rot` for *Drosera
-   rotundifolia*, `dact fuch` for *Dactylorhiza maculata* subsp. *fuchsii*. Tap
-   the mic icon next to the search box to dictate a species name instead of
-   typing (see note below).
+   habitat, layer cover), pick a cover-abundance scale, then add species —
+   either type (abbreviation search: `dro rot` for *Drosera rotundifolia*,
+   `dact fuch` for *Dactylorhiza maculata* subsp. *fuchsii*) or use **voice
+   logging** (see below) to log species hands-free while walking the plot.
 4. **New sighting**: a quicker one-species record — species, GPS, date,
-   photo, notes.
+   photo, notes. The mic button next to its search box dictates a single name
+   (see note below).
 5. **Records** tab: browse and search everything you've logged.
 6. **Settings** tab: export to CSV (for GIS/stats tools) or a full JSON
    backup (records + photos, for moving to another device), import a backup,
@@ -58,15 +58,39 @@ without a long wait; loosen it to 15–20 m under forest canopy or near
 buildings where satellite signal is weaker. Tap the button again to cancel a
 capture in progress.
 
-### Voice dictation
+### Voice dictation & voice logging
 
-The mic button next to a species search box uses the browser's built-in
-speech recognition (Web Speech API) to fill in a spoken name. Unlike the rest
-of the app, **this needs an active internet connection** — browsers send
-audio to a cloud speech service, there's no offline speech-to-text available
-in-browser. It's a convenience for when you have signal; typing / search
-still works fully offline. The button only appears if your browser supports
-it.
+Both use the browser's built-in speech recognition (Web Speech API). Unlike
+the rest of the app, **this needs an active internet connection** — audio is
+sent to Google's (Chrome/Edge/Brave/Arc) or Apple's (Safari) speech service,
+there's no offline speech-to-text in a browser. Typing/search still work
+fully offline; the mic buttons only appear if your browser supports it.
+
+The raw transcript is never trusted as a literal string — generic dictation
+models mangle Latin binomials, and mishear the same word differently
+depending on the speaker's accent. Instead, every recognized phrase (the
+engine's top several alternative guesses, not just its first pick) is scored
+against the entire bundled taxon list using a phonetic + fuzzy-edit-distance
+match, including a whole-word-blob comparison specifically so that a Latin
+word getting mis-split into fake English fragments (e.g. "Drosera" heard as
+"dro sarah") still resolves correctly. Then:
+- **confident, clear winner** → filled in / added automatically
+- **plausible but ambiguous** → shown as a short tap-to-pick list
+- **not recognizable at all** → it speaks "that wasn't clear, please repeat"
+  and listens again (up to 3 times, then falls back to manual entry)
+
+**Sighting form**: the mic button dictates one species name into the search
+box.
+
+**Relevé species list — "Start voice logging"**: a hands-free mode for
+walking a plot and calling out species as you spot them. Toggle it on, and
+it keeps listening continuously (auto-restarting between phrases) until you
+toggle it off — no need to touch the screen between species. Confident
+matches are added straight to the list with a spoken confirmation; matches
+that were ambiguous are still added, but flagged <code>unconfirmed</code> in
+the list (tap the flag once you've visually confirmed it's correct). Turn
+off spoken confirmations in **Settings → Voice logging** if you'd rather
+work in silence.
 
 ## Species database
 

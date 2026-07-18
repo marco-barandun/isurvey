@@ -1,0 +1,16 @@
+{
+  "name": "iSurvey — vegetation surveys",
+  "short_name": "iSurvey",
+  "description": "Offline-first vegetation relevés and species sightings, in the field.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f6f1",
+  "theme_color": "#2f6b47",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

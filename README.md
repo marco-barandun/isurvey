@@ -1,10 +1,11 @@
 # iSurvey
 
 Offline-first vegetation surveys in the browser — inspired by InfoFlora's
-FloraApp. Record plot-based **relevés** (species lists with cover-abundance)
-and quick single-species **sightings**, entirely on your device. Installable
-as an app; once opened once, it keeps working with zero connectivity —
-species search, saving records, photos, everything.
+FloraApp. Record plot-based **relevés** (species lists with cover-abundance),
+fast **transects** (walk-and-call-out species lists, voice-first), and quick
+single-species **observations**, entirely on your device. Installable as an app;
+once opened once, it keeps working with zero connectivity — species search,
+saving records, photos, everything.
 
 ## Quick start
 
@@ -22,11 +23,17 @@ species search, saving records, photos, everything.
    either type (abbreviation search: `dro rot` for *Drosera rotundifolia*,
    `dact fuch` for *Dactylorhiza maculata* subsp. *fuchsii*) or use **voice
    logging** (see below) to log species hands-free while walking the plot.
-4. **New sighting**: a quicker one-species record — species, GPS, date,
+4. **New observation**: a quicker one-species record — species, GPS, date,
    photo, notes. The mic button next to its search box dictates a single name
    (see note below).
-5. **Records** tab: browse and search everything you've logged.
-6. **Settings** tab: export to CSV (for GIS/stats tools) or a full JSON
+5. **New transect**: the fastest option — no plot metadata or cover-abundance,
+   just GPS plus a running species list. Toggle **Start voice logging** and
+   walk, calling out each species as you spot it; entries are added
+   hands-free with a certainty score, and anything uncertain surfaces in
+   **Review & approve** for you to confirm, fix, or discard afterwards (see
+   below).
+6. **Records** tab: browse and search everything you've logged.
+7. **Settings** tab: export to CSV (for GIS/stats tools) or a full JSON
    backup (records + photos, for moving to another device), import a backup,
    or erase local data.
 
@@ -37,8 +44,11 @@ uploaded anywhere:
 - **releve**: plot metadata (date/time, GPS, altitude, area, slope, aspect,
   habitat, layer cover %) + a species list, each entry with a layer
   (tree/shrub/herb/moss) and a cover-abundance value.
-- **sighting**: one taxon + GPS/date/photo/notes.
-- **photos**: attached to either, stored as blobs.
+- **transect**: date/time, GPS, notes + a species list, each entry with a
+  0–1 certainty score, a `reviewed` flag, and its source (`voice`/`manual`).
+  No plot metadata or cover-abundance — it's the fast, list-building option.
+- **observation**: one taxon + GPS/date/photo/notes.
+- **photos**: attached to a relevé or observation, stored as blobs.
 
 ### Cover-abundance scales
 
@@ -79,18 +89,62 @@ word getting mis-split into fake English fragments (e.g. "Drosera" heard as
 - **not recognizable at all** → it speaks "that wasn't clear, please repeat"
   and listens again (up to 3 times, then falls back to manual entry)
 
-**Sighting form**: the mic button dictates one species name into the search
+**Voice logging specifically** (walking a relevé or transect) uses one more
+layer on top: since several species said in sequence can land in a single
+recognized phrase (the pause between them wasn't quite long enough), each
+result is run through a word-segmentation pass — the same kind of
+dictionary-based segmentation used to split run-on text — scoring every
+possible word window against the whole taxon list and finding the split that
+maximizes total confidence, so "achillea millefolium silene vulgaris" heard
+as one phrase still resolves into two separate species instead of failing to
+match either.
+
+**Nomenclature tolerance**: rank markers (`subsp.`, `var.`, `f.`, `aggr.`,
+`cf.`) are optional when matching, not required — saying "Dactylorhiza
+maculata fuchsii" matches *Dactylorhiza maculata* subsp. *fuchsii* exactly as
+well as saying "subsp." would, since skipping a rank word isn't treated as
+an incomplete match the way skipping a real name word is. A few spoken/typed
+alternate forms are also normalized to the abbreviation used in the
+taxonomy — "aggregate" or "agg" both match a taxon written with "aggr."
+
+**Observation form**: the mic button dictates one species name into the search
 box.
 
-**Relevé species list — "Start voice logging"**: a hands-free mode for
-walking a plot and calling out species as you spot them. Toggle it on, and
+**"Start voice logging"** (relevé species list, and transects): a hands-free
+mode for walking and calling out species as you spot them. Toggle it on, and
 it keeps listening continuously (auto-restarting between phrases) until you
 toggle it off — no need to touch the screen between species. Confident
 matches are added straight to the list with a spoken confirmation; matches
-that were ambiguous are still added, but flagged <code>unconfirmed</code> in
-the list (tap the flag once you've visually confirmed it's correct). Turn
-off spoken confirmations in **Settings → Voice logging** if you'd rather
-work in silence.
+that were ambiguous are still added, but flagged for you to check afterwards.
+Turn off spoken confirmations in **Settings → Voice logging** if you'd rather
+work in silence. In a relevé this just flags the entry `unconfirmed`; in a
+transect, see below — every entry carries a real certainty score.
+
+## Transects
+
+The lightest-weight survey type: no plot metadata, no cover-abundance, just
+GPS plus a species list. Meant for walking a line and building a species list
+as fast as possible — by voice, by manual search, or both mixed together.
+
+Every entry gets a **certainty score** (0–100%): manual picks are always
+100%; voice-logged entries carry the real match confidence from the phonetic
+matcher described above. Anything below the confidence threshold used for
+auto-approval starts unreviewed, shown with a colored percentage pill in the
+species list (tap it to approve on the spot).
+
+**Review & approve** is a dedicated screen (reachable any time from the
+transect editor) listing every unreviewed entry, lowest-certainty first, with
+three actions per row:
+- **✓ Approve** — confirm it's correct
+- **✎ Edit** — search and swap in the actual species (marks it reviewed)
+- **✕ Remove** — it was a false catch, discard it
+
+There's also a bulk **"Approve all ≥ 90% certainty"** button for quickly
+clearing the obvious ones. While voice logging is running, every time you
+cross a multiple of **Settings → Review checkpoint every N taxa** (default
+30), you get a non-blocking toast/spoken nudge — it doesn't interrupt your
+walk, it's just a natural point to open Review if convenient. Review whenever
+suits you: after every checkpoint, or all at once at the end.
 
 ## Species database
 

@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
   <title>iSurvey — offline vegetation surveys</title>
-  <meta name="description" content="Record vegetation relevés and species sightings in the field, fully offline.">
+  <meta name="description" content="Record vegetation relevés and species observations in the field, fully offline.">
   <meta name="theme-color" content="#2f6b47">
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="styles.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=10">
   <script>
     (() => { try { const t = localStorage.getItem("isurvey.theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch {} })();
   </script>
@@ -47,9 +47,14 @@
           <span>New relevé</span>
           <small>Plot survey with species &amp; cover-abundance</small>
         </button>
-        <button class="tile" id="newSightingBtn">
+        <button class="tile" id="newTransectBtn">
+          <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><path d="M3 18c4-8 6 6 10-2 2-4 4-4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="12.2" r="1.4" fill="currentColor"/><circle cx="13.3" cy="14.8" r="1.4" fill="currentColor"/><circle cx="19" cy="11.5" r="1.4" fill="currentColor"/></svg>
+          <span>New transect</span>
+          <small>Walk &amp; log a species list, hands-free</small>
+        </button>
+        <button class="tile" id="newObservationBtn">
           <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><path d="M12 21s-7-5.2-7-10.5C5 6.9 8.1 4 12 4s7 2.9 7 6.5C19 15.8 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="10.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
-          <span>New sighting</span>
+          <span>New observation</span>
           <small>Quick single-species record</small>
         </button>
       </div>
@@ -179,64 +184,160 @@
       </div>
     </section>
 
-    <!-- ---------- SIGHTING EDITOR ---------- -->
-    <section id="view-sighting" class="view">
+    <!-- ---------- OBSERVATION EDITOR ---------- -->
+    <section id="view-observation" class="view">
       <div class="editor-head">
         <button class="btn btn-icon back-btn" data-back title="Back" aria-label="Back">
           <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
-        <div class="editor-title">New sighting</div>
-        <button class="btn btn-icon" id="sightingDeleteBtn" title="Delete" aria-label="Delete">
+        <div class="editor-title">New observation</div>
+        <button class="btn btn-icon" id="observationDeleteBtn" title="Delete" aria-label="Delete">
           <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
 
       <div class="editor-scroll">
         <div class="ac-wrap">
-          <label class="field-label" for="sightingTaxonInput">Species</label>
+          <label class="field-label" for="observationTaxonInput">Species</label>
           <div class="input-with-btn">
-            <input id="sightingTaxonInput" class="input" autocomplete="off" placeholder="Type to search or add a name…">
-            <button type="button" id="sightingDictateBtn" class="btn btn-icon mic-btn" title="Dictate species name (needs a connection)" aria-label="Dictate species name" hidden>
+            <input id="observationTaxonInput" class="input" autocomplete="off" placeholder="Type to search or add a name…">
+            <button type="button" id="observationDictateBtn" class="btn btn-icon mic-btn" title="Dictate species name (needs a connection)" aria-label="Dictate species name" hidden>
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
             </button>
           </div>
-          <div id="sightingDictateStatus" class="hint"></div>
-          <div id="sightingAcMenu" class="ac-menu"></div>
+          <div id="observationDictateStatus" class="hint"></div>
+          <div id="observationAcMenu" class="ac-menu"></div>
         </div>
-        <div id="sightingTaxonChip" class="chip-row"></div>
+        <div id="observationTaxonChip" class="chip-row"></div>
 
         <div class="settings-grid" style="margin-top:12px">
-          <label>Date<input type="date" id="sightingDate" class="input"></label>
-          <label>Time<input type="time" id="sightingTime" class="input"></label>
+          <label>Date<input type="date" id="observationDate" class="input"></label>
+          <label>Time<input type="time" id="observationTime" class="input"></label>
         </div>
-        <button type="button" id="sightingGpsBtn" class="btn full">
+        <button type="button" id="observationGpsBtn" class="btn full">
           <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           Capture GPS location (averaged)
         </button>
-        <div id="sightingGpsStatus" class="hint"></div>
+        <div id="observationGpsStatus" class="hint"></div>
         <div class="settings-grid">
-          <label>Latitude<input type="number" id="sightingLat" class="input" step="0.00001"></label>
-          <label>Longitude<input type="number" id="sightingLon" class="input" step="0.00001"></label>
+          <label>Latitude<input type="number" id="observationLat" class="input" step="0.00001"></label>
+          <label>Longitude<input type="number" id="observationLon" class="input" step="0.00001"></label>
         </div>
 
         <div class="photo-row" style="margin-top:12px">
           <label class="btn full photo-add-btn">
             <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M4 8a2 2 0 0 1 2-2h1.2l.9-1.5A1 1 0 0 1 8.9 4h6.2a1 1 0 0 1 .86.5L16.8 6H18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="13" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
             Add photo
-            <input type="file" id="sightingPhotoInput" accept="image/*" capture="environment" hidden multiple>
+            <input type="file" id="observationPhotoInput" accept="image/*" capture="environment" hidden multiple>
           </label>
         </div>
-        <div id="sightingPhotos" class="photo-grid"></div>
+        <div id="observationPhotos" class="photo-grid"></div>
 
-        <label class="field-label" for="sightingNotes" style="margin-top:10px">Notes</label>
-        <textarea id="sightingNotes" class="input" rows="3" placeholder="Free notes…"></textarea>
+        <label class="field-label" for="observationNotes" style="margin-top:10px">Notes</label>
+        <textarea id="observationNotes" class="input" rows="3" placeholder="Free notes…"></textarea>
       </div>
 
       <div class="editor-foot">
-        <button id="sightingSaveBtn" class="btn btn-primary full">
+        <button id="observationSaveBtn" class="btn btn-primary full">
           <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M5 13l4 4L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Save sighting
+          Save observation
         </button>
+      </div>
+    </section>
+
+    <!-- ---------- TRANSECT EDITOR ---------- -->
+    <section id="view-transect" class="view">
+      <div class="editor-head">
+        <button class="btn btn-icon back-btn" data-back title="Back" aria-label="Back">
+          <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <input id="transectName" class="input editor-title-input" placeholder="Transect ID">
+        <button class="btn btn-icon" id="transectDeleteBtn" title="Delete" aria-label="Delete">
+          <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+
+      <div class="editor-scroll">
+        <details class="fold" open>
+          <summary>Location</summary>
+          <div class="fold-body">
+            <div class="settings-grid">
+              <label>Date<input type="date" id="transectDate" class="input"></label>
+              <label>Time<input type="time" id="transectTime" class="input"></label>
+            </div>
+            <button type="button" id="transectGpsBtn" class="btn full">
+              <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+              Capture GPS location (averaged)
+            </button>
+            <div id="transectGpsStatus" class="hint"></div>
+            <div class="settings-grid">
+              <label>Latitude<input type="number" id="transectLat" class="input" step="0.00001"></label>
+              <label>Longitude<input type="number" id="transectLon" class="input" step="0.00001"></label>
+            </div>
+            <div class="settings-grid">
+              <label>Altitude (m)<input type="number" id="transectAlt" class="input" step="1"></label>
+              <label>Accuracy (m)<input type="number" id="transectAcc" class="input" step="1" readonly></label>
+            </div>
+          </div>
+        </details>
+
+        <details class="fold" open>
+          <summary>Species list <span id="transectSpeciesCount" class="tag"></span></summary>
+          <div class="fold-body">
+            <div id="transectListStatus" class="hint"></div>
+
+            <button type="button" id="transectVoiceLogBtn" class="btn full voice-log-btn" hidden>
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+              Start voice logging
+            </button>
+            <div id="transectVoiceLogStatus" class="hint"></div>
+
+            <button type="button" id="transectReviewBtn" class="btn full" style="margin-top:8px">Review &amp; approve</button>
+
+            <div class="ac-wrap" style="margin-top:12px">
+              <label class="field-label" for="transectSearchInput">Add species manually</label>
+              <input id="transectSearchInput" class="input" autocomplete="off" placeholder="Type to search — e.g. dro rot for Drosera rotundifolia">
+              <div id="transectAcMenu" class="ac-menu"></div>
+            </div>
+
+            <div id="transectSpeciesTable" class="species-table"></div>
+          </div>
+        </details>
+
+        <details class="fold">
+          <summary>Notes</summary>
+          <div class="fold-body">
+            <textarea id="transectNotes" class="input" rows="3" placeholder="Free notes…"></textarea>
+          </div>
+        </details>
+      </div>
+
+      <div class="editor-foot">
+        <button id="transectSaveBtn" class="btn btn-primary full">
+          <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M5 13l4 4L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Save transect
+        </button>
+      </div>
+    </section>
+
+    <!-- ---------- TRANSECT REVIEW ---------- -->
+    <section id="view-transect-review" class="view">
+      <div class="editor-head">
+        <button class="btn btn-icon back-btn" data-back title="Done" aria-label="Done">
+          <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="editor-title">Review taxa <span id="reviewCount" class="tag"></span></div>
+        <div style="width:40px"></div>
+      </div>
+      <div class="editor-scroll">
+        <div id="reviewReplaceBox" class="ac-wrap" hidden>
+          <div class="hint" id="reviewReplaceLabel"></div>
+          <input id="reviewReplaceInput" class="input" autocomplete="off" placeholder="Type to search for the correct species…">
+          <div id="reviewReplaceMenu" class="ac-menu"></div>
+          <button type="button" id="reviewReplaceCancelBtn" class="btn btn-ghost full" style="margin-top:6px">Cancel</button>
+        </div>
+        <button type="button" id="reviewApproveAllBtn" class="btn full">Approve all ≥ 90% certainty</button>
+        <div id="reviewList" class="record-list" style="margin-top:12px"></div>
       </div>
     </section>
 
@@ -253,7 +354,8 @@
         <input id="recordsSearch" class="input" autocomplete="off" placeholder="Search records…" style="margin-bottom:10px">
         <div id="recordsFilter" class="segmented">
           <label class="seg"><input type="checkbox" value="releve" checked><span>Relevés</span></label>
-          <label class="seg"><input type="checkbox" value="sighting" checked><span>Sightings</span></label>
+          <label class="seg"><input type="checkbox" value="transect" checked><span>Transects</span></label>
+          <label class="seg"><input type="checkbox" value="observation" checked><span>Observations</span></label>
         </div>
         <div id="recordsListFull" class="record-list" style="margin-top:12px"></div>
       </div>
@@ -287,7 +389,11 @@
 
         <h4>Voice logging</h4>
         <label class="check"><input type="checkbox" id="voiceSpeakFeedback"><span>Speak back each species as it's logged</span></label>
-        <p class="hint" style="margin:0">In a relevé's species list, "Start voice logging" listens continuously so you can walk a plot and call out species hands-free. Confident matches are added right away; unsure matches are still added but flagged <span class="tag" style="color:var(--danger);background:var(--danger-soft)">unconfirmed</span> in the list for you to check afterwards — tap the flag to clear it. If nothing usable is heard, it asks you to repeat by voice. Needs a connection (Google/Apple speech recognition), same as single-field dictation.</p>
+        <p class="hint" style="margin:0">In a relevé's species list or a transect, "Start voice logging" listens continuously so you can walk hands-free and call out species as you spot them. Confident matches are added right away; unsure matches are still added but flagged for you to check afterwards. If nothing usable is heard, it asks you to repeat by voice. Needs a connection (Google/Apple speech recognition), same as single-field dictation.</p>
+
+        <label class="field-label" for="voiceReviewCheckpointInput" style="margin-top:14px">Review checkpoint every N taxa</label>
+        <input type="number" id="voiceReviewCheckpointInput" class="input" min="5" max="200" step="5">
+        <p class="hint" style="margin:0">While voice logging a transect, you get a gentle (non-interrupting) nudge every time this many taxa have been logged, as a natural point to open <em>Review &amp; approve</em>. You can always review sooner, or wait until the end — this is just a reminder.</p>
 
         <h4>Export</h4>
         <p class="hint">Everything stays on this device unless you export it.</p>
@@ -331,7 +437,7 @@
     </button>
   </nav>
 
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=10"></script>
   <script>
     (() => {
       const root = document.documentElement;

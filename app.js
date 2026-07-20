@@ -120,7 +120,7 @@ const Store = {
   deletePhoto: id => idbDelete("photos", id),
   allPhotos: () => idbAll("photos"),
   getSettings: () => idbGet("settings", "app").then(s =>
-    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true }, s || {})),
+    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30 }, s || {})),
   saveSettings: s => { s.key = "app"; return idbPut("settings", s); },
   wipeAll: () => Promise.all([idbClear("records"), idbClear("photos"), idbClear("settings")]),
 };
@@ -225,11 +225,12 @@ function coverInputHtml(scaleKey, currentValue) {
 /* ---------------------------------------------------------- */
 
 const viewStack = ["home"];
-let onLeaveReleveView = null; // set by wireVoiceLogging to stop a stray mic session on navigation
+const viewLeaveHooks = {}; // viewName -> fn; set by wireVoiceLogging to stop a stray mic session on navigation
 
 function showView(name) {
-  const leavingReleve = $("#view-releve")?.classList.contains("active") && name !== "releve";
-  if (leavingReleve && onLeaveReleveView) onLeaveReleveView();
+  for (const [viewName, hook] of Object.entries(viewLeaveHooks)) {
+    if (viewName !== name && $("#view-" + viewName)?.classList.contains("active")) hook();
+  }
   $all(".view").forEach(v => v.classList.remove("active"));
   const el = $("#view-" + name);
   if (el) el.classList.add("active");
@@ -499,73 +500,180 @@ function wordScore(qw, tw, qPhon, tPhon) {
   return Math.min(1, score);
 }
 
-/* Score every taxon against every ASR alternative transcript using
-   two complementary strategies, taking whichever scores higher:
+/* Infraspecific rank markers — spoken (and often typed) forms
+   frequently drop these ("Dactylorhiza maculata fuchsii" instead of
+   "...subsp. fuchsii"), so they're excluded from the "how much of
+   the taxon did you actually cover" penalties below rather than
+   being treated like any other required word. */
+const RANK_WORDS = new Set(["subsp", "var", "f", "subvar", "aggr", "cf"]);
 
-   1. Word-by-word greedy alignment (transcript words matched to
-      taxon words in order, same left-to-right skipping idea as the
-      typed abbreviation search) — precise when word boundaries in
-      the transcript roughly match the taxon's.
+/* Alternate/spoken forms normalized to the abbreviation used in the
+   taxonomy, so e.g. saying "aggregate" matches a taxon written with
+   "aggr." — applied identically to query words and taxon words so
+   both sides land on the same canonical token. */
+const WORD_SYNONYMS = {
+  aggregate: "aggr", agg: "aggr",
+  subspecies: "subsp",
+  variety: "var",
+  forma: "f", form: "f",
+  confer: "cf", compare: "cf",
+};
+function canonicalizeWord(w) { return WORD_SYNONYMS[w] || w; }
+
+function ensureSpeciesIndexed(sp) {
+  if (sp._words) return;
+  sp._words = sp.t.toLowerCase().replace(/\./g, "").split(/\s+/).map(canonicalizeWord);
+  sp._phon = sp._words.map(phoneticCode);
+  sp._concat = sp._words.join("");
+  sp._concatPhon = phoneticCode(sp._concat);
+  sp._coreWordCount = sp._words.filter(w => !RANK_WORDS.has(w)).length;
+}
+
+function tokenize(text) {
+  const words = text.toLowerCase().replace(/[^a-z\s]/g, "").split(/\s+/).filter(Boolean).map(canonicalizeWord);
+  return { words, phon: words.map(phoneticCode) };
+}
+
+/* Score one taxon against one word window using two complementary
+   strategies, taking whichever scores higher:
+
+   1. Word-by-word greedy alignment (query words matched to taxon
+      words in order, same left-to-right skipping idea as the typed
+      abbreviation search) — precise when word boundaries in the
+      query roughly match the taxon's.
    2. Whole-string concatenation match (all words joined, spaces
       removed, compared as one blob) — dictation engines routinely
       split an unfamiliar Latin word into fake English-sounding
       fragments (e.g. "Drosera" heard as "dro sarah"); comparing the
       full letter sequence ignores where those spurious word breaks
       landed, so it stays accurate exactly when strategy 1 breaks
-      down.
+      down. */
+function scoreTaxonAgainstWords(sp, words, phon) {
+  ensureSpeciesIndexed(sp);
+  let wi = 0, total = 0;
+  const matchedTaxonIdx = new Set();
+  for (let i = 0; i < words.length; i++) {
+    let bestW = 0, bestJ = -1;
+    for (let j = wi; j < sp._words.length; j++) {
+      const s = wordScore(words[i], sp._words[j], phon[i], sp._phon[j]);
+      if (s > bestW) { bestW = s; bestJ = j; }
+    }
+    total += bestW;
+    if (bestJ >= 0) { wi = bestJ + 1; matchedTaxonIdx.add(bestJ); }
+  }
+  // Taxon words never said are only penalized when they're real
+  // content words — a skipped rank marker ("subsp.") isn't a sign
+  // of a weaker match.
+  let unmatchedTaxonWords = 0;
+  for (let j = 0; j < sp._words.length; j++) {
+    if (!matchedTaxonIdx.has(j) && !RANK_WORDS.has(sp._words[j])) unmatchedTaxonWords++;
+  }
+  const wordAlignScore = (total / words.length) * Math.max(0.5, 1 - 0.06 * unmatchedTaxonWords);
 
-   Returns top matches sorted by descending confidence. */
+  const concat = words.join("");
+  const concatPhon = phoneticCode(concat);
+  const charSim = strSim(concat, sp._concat);
+  const phonSim = strSim(concatPhon, sp._concatPhon);
+  const lenDiff = Math.abs(concat.length - sp._concat.length) / Math.max(concat.length, sp._concat.length, 1);
+  const lenPenalty = 1 - Math.min(0.3, lenDiff * 0.6);
+  const wholeScore = (charSim * 0.5 + phonSim * 0.5) * lenPenalty;
+
+  return Math.max(wordAlignScore, wholeScore);
+}
+
+/* Best (and second-best) taxon for one specific word window, used
+   by the multi-species segmenter below. Unlike whole-phrase
+   matching (where a genus-only utterance is deliberately allowed
+   to score high, since it's legitimately ambiguous among several
+   species and should surface as a tap-to-pick list), a segmentation
+   window competes against OTHER possible windows over the same
+   words — so a short window that only partially covers a candidate
+   taxon (e.g. one word matching just the genus of a two-word
+   species) needs to be scored down hard. Otherwise the DP below is
+   incentivized to fragment a correct multi-word match into cheaper-
+   looking partial pieces, since each fragment can cheaply find some
+   same-genus species to match against. */
+function bestTaxaForWords(words, phon) {
+  let best = null, second = null;
+  for (const sp of Species.all) {
+    ensureSpeciesIndexed(sp);
+    const raw = scoreTaxonAgainstWords(sp, words, phon);
+    // Coverage is measured against the taxon's core (non-rank-marker)
+    // word count, so omitting "subsp."/"var."/etc. isn't treated as
+    // an incomplete match the way skipping a real name word would be.
+    const coverage = Math.min(1, words.length / Math.max(1, sp._coreWordCount));
+    const score = coverage < 1 ? raw * coverage * coverage : raw;
+    if (!best || score > best.score) { second = best; best = { sp, score }; }
+    else if (!second || score > second.score) { second = { sp, score }; }
+  }
+  return { best, second };
+}
+
+/* Score every taxon against every ASR alternative transcript (as a
+   single whole phrase) — used where we know only one species was
+   said (single-field dictation). Returns top matches sorted by
+   descending confidence. */
 function fuzzyMatchTranscripts(transcripts, limit) {
   limit = limit || 6;
-  const qSets = transcripts.map(t => {
-    const words = t.toLowerCase().replace(/[^a-z\s]/g, "").split(/\s+/).filter(Boolean);
-    const concat = words.join("");
-    return { words, phon: words.map(phoneticCode), concat, concatPhon: phoneticCode(concat) };
-  }).filter(q => q.words.length);
+  const qSets = transcripts.map(tokenize).filter(q => q.words.length);
   if (!qSets.length) return [];
 
   const scored = [];
   for (const sp of Species.all) {
-    if (!sp._words) {
-      sp._words = sp.t.toLowerCase().replace(/\./g, "").split(/\s+/);
-      sp._phon = sp._words.map(phoneticCode);
-      sp._concat = sp._words.join("");
-      sp._concatPhon = phoneticCode(sp._concat);
-    }
     let best = 0;
     for (const q of qSets) {
-      // Strategy 1: word-by-word alignment, discounted for taxon
-      // words that were never matched (e.g. a subspecies epithet
-      // nobody said) so an exact shorter match outranks a longer one.
-      let wi = 0, total = 0;
-      for (let i = 0; i < q.words.length; i++) {
-        let bestW = 0, bestJ = -1;
-        for (let j = wi; j < sp._words.length; j++) {
-          const s = wordScore(q.words[i], sp._words[j], q.phon[i], sp._phon[j]);
-          if (s > bestW) { bestW = s; bestJ = j; }
-        }
-        total += bestW;
-        if (bestJ >= 0) wi = bestJ + 1;
-      }
-      const unmatchedTaxonWords = Math.max(0, sp._words.length - q.words.length);
-      const wordAlignScore = (total / q.words.length) * Math.max(0.5, 1 - 0.06 * unmatchedTaxonWords);
-
-      // Strategy 2: whole-string match, penalized when the overall
-      // length is very different (guards against short queries
-      // matching long unrelated names).
-      const charSim = strSim(q.concat, sp._concat);
-      const phonSim = strSim(q.concatPhon, sp._concatPhon);
-      const lenDiff = Math.abs(q.concat.length - sp._concat.length) / Math.max(q.concat.length, sp._concat.length, 1);
-      const lenPenalty = 1 - Math.min(0.3, lenDiff * 0.6);
-      const wholeScore = (charSim * 0.5 + phonSim * 0.5) * lenPenalty;
-
-      const score = Math.max(wordAlignScore, wholeScore);
+      const score = scoreTaxonAgainstWords(sp, q.words, q.phon);
       if (score > best) best = score;
     }
     if (best > 0.15) scored.push({ sp, score: best });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
+}
+
+/* Segment a transcript into one-or-more species names via dynamic
+   programming (like segmenting run-on text against a dictionary):
+   scores every possible word window against the entire taxon list
+   and finds the split that maximizes total match confidence. This
+   is what lets continuous voice logging correctly resolve a phrase
+   like "achillea millefolium silene vulgaris" — captured as a
+   single recognized utterance because two names were said close
+   together — into two separate species instead of trying (and
+   failing) to match the whole blob as one taxon. A small per-word
+   skip option lets it route around filler/junk words instead of
+   letting them drag a real match's score down. */
+const SEG_MAX_LEN = 4;
+const SEG_MIN_SCORE = 0.32;
+const SEG_PENALTY = 0.03;
+const SEG_SKIP_PENALTY = 0.06;
+
+function segmentTranscript(transcript) {
+  const { words, phon } = tokenize(transcript);
+  const n = words.length;
+  if (!n) return [];
+
+  const dp = new Array(n + 1).fill(null);
+  dp[0] = { score: 0, segs: [] };
+  for (let i = 1; i <= n; i++) {
+    if (dp[i - 1]) {
+      const cand = dp[i - 1].score - SEG_SKIP_PENALTY;
+      if (!dp[i] || cand > dp[i].score) dp[i] = { score: cand, segs: dp[i - 1].segs };
+    }
+    for (let len = 1; len <= SEG_MAX_LEN && i - len >= 0; len++) {
+      const j = i - len;
+      if (!dp[j]) continue;
+      const { best, second } = bestTaxaForWords(words.slice(j, i), phon.slice(j, i));
+      if (!best || best.score < SEG_MIN_SCORE) continue;
+      // Weight by segment length so one solid multi-word match is
+      // preferred over splitting the same words into several
+      // cheaper-looking fragments.
+      const cand = dp[j].score + best.score * len - SEG_PENALTY;
+      if (!dp[i] || cand > dp[i].score) {
+        dp[i] = { score: cand, segs: [...dp[j].segs, { sp: best.sp, score: best.score, second: second ? second.score : 0, from: j, to: i }] };
+      }
+    }
+  }
+  return dp[n] ? dp[n].segs : [];
 }
 
 function speak(text, onEnd) {
@@ -673,7 +781,7 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
 /* each recognized name is matched and added automatically     */
 /* ---------------------------------------------------------- */
 
-function wireVoiceLogging(btn, statusEl, addSpecies) {
+function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return;
   btn.hidden = false;
@@ -681,7 +789,13 @@ function wireVoiceLogging(btn, statusEl, addSpecies) {
   rec.lang = navigator.language || "en-US";
   rec.interimResults = false;
   rec.maxAlternatives = 6;
-  rec.continuous = true;
+  // Deliberately NOT continuous: Chrome's continuous mode batches speech
+  // into fewer, longer results with looser endpointing, which is exactly
+  // what causes several species said in sequence to get glued into one
+  // recognized phrase. Restarting a single-shot session immediately after
+  // each result (below) gives the same tight per-utterance segmentation
+  // that makes the single-field dictation accurate, while still being
+  // hands-free — the gap between stop and restart is a few milliseconds.
 
   let active = false;    // user has toggled logging on
   let running = false;   // a recognition session is currently alive
@@ -705,7 +819,7 @@ function wireVoiceLogging(btn, statusEl, addSpecies) {
     setStatus("Voice logging stopped.");
     try { rec.stop(); } catch (e) { /* not running */ }
   }
-  onLeaveReleveView = stopLogging;
+  viewLeaveHooks[viewName] = stopLogging;
 
   btn.addEventListener("click", async () => {
     if (active) { stopLogging(); return; }
@@ -734,13 +848,24 @@ function wireVoiceLogging(btn, statusEl, addSpecies) {
     // transient network hiccup etc — 'end' will fire next and restart while active
   });
 
-  rec.addEventListener("result", e => {
+  rec.addEventListener("result", async e => {
     const res = e.results[e.results.length - 1];
     const transcripts = Array.from(res).map(alt => alt.transcript);
-    const matches = fuzzyMatchTranscripts(transcripts, 4);
-    const top = matches[0], second = matches[1];
 
-    if (!top || top.score < VOICE_LOW_CONF) {
+    // Segment every ASR alternative into one-or-more species (usually
+    // one, but a phrase like "achillea millefolium silene vulgaris" said
+    // without enough of a pause resolves into two) and keep whichever
+    // alternative's segmentation scores best overall.
+    let segs = null, segsScore = -Infinity;
+    for (const t of transcripts.slice(0, 3)) {
+      const s = segmentTranscript(t);
+      if (!s.length) continue;
+      const total = s.reduce((sum, seg) => sum + seg.score, 0);
+      if (total > segsScore) { segsScore = total; segs = s; }
+    }
+    const usable = (segs || []).filter(seg => seg.score >= VOICE_LOW_CONF);
+
+    if (!usable.length) {
       unclearStreak++;
       setStatus(`Didn't catch that ("${transcripts[0] || "…"}") — say the species again`);
       if (unclearStreak <= 2 && speakFeedback) {
@@ -749,10 +874,31 @@ function wireVoiceLogging(btn, statusEl, addSpecies) {
       return;
     }
     unclearStreak = 0;
-    const confident = top.score >= VOICE_HIGH_CONF && (!second || top.score - second.score >= 0.12);
-    const added = addSpecies(top.sp, { unconfirmed: !confident, silent: true });
-    setStatus(`${added ? (confident ? "Added" : "Added — please confirm") : "Already logged"}: ${top.sp.t}`);
-    if (speakFeedback) speak(confident ? top.sp.t : `${top.sp.t}, please confirm`);
+
+    const addedNames = [], unsureNames = [];
+    let lastCheckpoint = null;
+    for (const seg of usable) {
+      const confident = seg.score >= VOICE_HIGH_CONF && (seg.score - (seg.second || 0) >= 0.12);
+      const result = await addSpecies(seg.sp, { unconfirmed: !confident, score: seg.score, silent: true });
+      if (!result || result.added === false) continue;
+      (confident ? addedNames : unsureNames).push(seg.sp.t);
+      if (result.checkpoint) lastCheckpoint = result.checkpoint;
+    }
+
+    const all = [...addedNames, ...unsureNames];
+    if (!all.length) {
+      setStatus("Already logged.");
+    } else {
+      setStatus(`Added: ${all.join(", ")}${unsureNames.length ? " (please confirm)" : ""}`);
+      if (speakFeedback) {
+        if (all.length === 1) speak(unsureNames.length ? `${all[0]}, please confirm` : all[0]);
+        else speak(`Added ${all.length} species${unsureNames.length ? `, ${unsureNames.length} need confirming` : ""}.`);
+      }
+    }
+    if (lastCheckpoint) {
+      toast(`${lastCheckpoint} taxa logged — review when ready`);
+      if (speakFeedback) speak(`${lastCheckpoint} species logged. Review when you're ready.`);
+    }
   });
 }
 
@@ -854,11 +1000,11 @@ const ReleveEditor = {
     const r = this.current;
     if (r.species.some(s => s.taxon === sp.t)) {
       if (!opts.silent) toast("Already in the list");
-      return false;
+      return { added: false };
     }
     r.species.push({ taxon: sp.t, family: sp.f || "", layer: "herb", cover: "", voiceUnconfirmed: !!opts.unconfirmed });
     this.renderSpecies();
-    return true;
+    return { added: true };
   },
 
   readForm() {
@@ -901,15 +1047,15 @@ const ReleveEditor = {
 };
 
 /* ============================================================
-   SIGHTING EDITOR
+   OBSERVATION EDITOR
    ============================================================ */
 
-const SightingEditor = {
+const ObservationEditor = {
   current: null,
 
   blank() {
     return {
-      id: uid(), type: "sighting", createdAt: Date.now(), updatedAt: Date.now(),
+      id: uid(), type: "observation", createdAt: Date.now(), updatedAt: Date.now(),
       taxon: "", family: "",
       date: todayDate(), time: nowTime(),
       lat: "", lon: "",
@@ -920,7 +1066,7 @@ const SightingEditor = {
   openNew() {
     this.current = this.blank();
     this.render();
-    pushView("sighting");
+    pushView("observation");
   },
 
   async openExisting(id) {
@@ -928,24 +1074,24 @@ const SightingEditor = {
     if (!rec) return;
     this.current = rec;
     await this.render();
-    pushView("sighting");
+    pushView("observation");
   },
 
   async render() {
     const s = this.current;
-    $("#sightingDate").value = s.date;
-    $("#sightingTime").value = s.time;
-    $("#sightingLat").value = s.lat;
-    $("#sightingLon").value = s.lon;
-    $("#sightingNotes").value = s.notes;
-    $("#sightingGpsStatus").textContent = "";
+    $("#observationDate").value = s.date;
+    $("#observationTime").value = s.time;
+    $("#observationLat").value = s.lat;
+    $("#observationLon").value = s.lon;
+    $("#observationNotes").value = s.notes;
+    $("#observationGpsStatus").textContent = "";
     this.renderTaxonChip();
-    await renderPhotoGrid(s.photoIds, $("#sightingPhotos"));
+    await renderPhotoGrid(s.photoIds, $("#observationPhotos"));
   },
 
   renderTaxonChip() {
     const s = this.current;
-    const host = $("#sightingTaxonChip");
+    const host = $("#observationTaxonChip");
     if (!s.taxon) { host.innerHTML = ""; return; }
     host.innerHTML = `<span class="chip" style="font-style:italic">${esc(s.taxon)}<button type="button" id="clearTaxonBtn">×</button></span>`;
     $("#clearTaxonBtn").addEventListener("click", () => { s.taxon = ""; s.family = ""; this.renderTaxonChip(); });
@@ -959,29 +1105,275 @@ const SightingEditor = {
 
   readForm() {
     const s = this.current;
-    s.date = $("#sightingDate").value;
-    s.time = $("#sightingTime").value;
-    s.lat = $("#sightingLat").value;
-    s.lon = $("#sightingLon").value;
-    s.notes = $("#sightingNotes").value;
+    s.date = $("#observationDate").value;
+    s.time = $("#observationTime").value;
+    s.lat = $("#observationLat").value;
+    s.lon = $("#observationLon").value;
+    s.notes = $("#observationNotes").value;
   },
 
   async save() {
     this.readForm();
     if (!this.current.taxon) { toast("Pick a species first", "err"); return; }
     await Store.saveRecord(this.current);
-    toast("Sighting saved", "ok");
+    toast("Observation saved", "ok");
     popView();
     Home.refresh();
   },
 
   async remove() {
-    if (!confirm("Delete this sighting? This cannot be undone.")) return;
+    if (!confirm("Delete this observation? This cannot be undone.")) return;
     for (const id of this.current.photoIds) await Store.deletePhoto(id);
     await Store.deleteRecord(this.current.id);
-    toast("Sighting deleted");
+    toast("Observation deleted");
     popView();
     Home.refresh();
+  },
+};
+
+/* ============================================================
+   TRANSECT EDITOR — a fast, "incomplete" walking survey: no plot
+   metadata or cover-abundance, just a running species list built
+   by voice (hands-free) or manual search, each entry carrying a
+   certainty score and a reviewed flag for later approval.
+   ============================================================ */
+
+function certaintyPillHtml(s) {
+  if (s.reviewed) return `<span class="certainty-pill c-high" title="Confirmed">✓</span>`;
+  const pct = Math.round((s.certainty || 0) * 100);
+  const cls = pct >= 85 ? "c-high" : pct >= 50 ? "c-mid" : "c-low";
+  return `<button type="button" class="certainty-pill ${cls}" title="Tap to approve">${pct}%</button>`;
+}
+
+const TransectEditor = {
+  current: null,
+
+  blank() {
+    return {
+      id: uid(), type: "transect", createdAt: Date.now(), updatedAt: Date.now(),
+      name: "TRA-" + todayDate().replace(/-/g, "") + "-" + Math.floor(Math.random() * 90 + 10),
+      date: todayDate(), time: nowTime(),
+      lat: "", lon: "", alt: "", acc: "",
+      species: [], notes: "",
+    };
+  },
+
+  openNew() {
+    this.current = this.blank();
+    this.render();
+    pushView("transect");
+  },
+
+  async openExisting(id) {
+    const rec = await Store.getRecord(id);
+    if (!rec) return;
+    this.current = rec;
+    this.render();
+    pushView("transect");
+  },
+
+  render() {
+    const t = this.current;
+    $("#transectName").value = t.name;
+    $("#transectDate").value = t.date;
+    $("#transectTime").value = t.time;
+    $("#transectLat").value = t.lat;
+    $("#transectLon").value = t.lon;
+    $("#transectAlt").value = t.alt;
+    $("#transectAcc").value = t.acc;
+    $("#transectNotes").value = t.notes;
+    $("#transectGpsStatus").textContent = "";
+    $("#transectVoiceLogStatus").textContent = "";
+    this.renderSpecies();
+  },
+
+  renderSpecies() {
+    const t = this.current;
+    const unreviewed = t.species.filter(s => !s.reviewed).length;
+    $("#transectSpeciesCount").textContent = t.species.length ? t.species.length : "";
+    $("#transectListStatus").textContent = t.species.length
+      ? `${t.species.length} logged · ${unreviewed} awaiting review`
+      : "";
+    $("#transectReviewBtn").textContent = unreviewed ? `Review & approve (${unreviewed})` : "Review & approve";
+
+    const host = $("#transectSpeciesTable");
+    if (!t.species.length) {
+      host.innerHTML = `<div class="empty-note">No species logged yet.</div>`;
+      return;
+    }
+    host.innerHTML = t.species.map((s, i) => `
+      <div class="species-row" data-i="${i}">
+        <div class="sp-info">
+          <div class="sp-name">${esc(s.taxon)}</div>
+          <div class="sp-fam">${esc(s.family || "")}</div>
+        </div>
+        ${certaintyPillHtml(s)}
+        <button type="button" class="rm-btn" title="Remove">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>`).join("");
+
+    $all(".species-row", host).forEach(row => {
+      const i = Number(row.dataset.i);
+      $(".rm-btn", row).addEventListener("click", () => { t.species.splice(i, 1); this.renderSpecies(); });
+      const pill = $(".certainty-pill", row);
+      if (pill) pill.addEventListener("click", () => { t.species[i].reviewed = true; this.renderSpecies(); });
+    });
+  },
+
+  async addSpecies(sp, opts) {
+    opts = opts || {};
+    const t = this.current;
+    if (t.species.some(s => s.taxon === sp.t)) {
+      if (!opts.silent) toast("Already in the list");
+      return { added: false };
+    }
+    const certainty = opts.score != null ? opts.score : 1;
+    t.species.push({
+      taxon: sp.t, family: sp.f || "",
+      certainty,
+      reviewed: certainty >= VOICE_HIGH_CONF,
+      source: opts.score != null ? "voice" : "manual",
+      loggedAt: Date.now(),
+    });
+    this.renderSpecies();
+
+    let checkpoint = null;
+    if (opts.score != null) {
+      const settings = await Store.getSettings();
+      const cpSize = Math.max(5, Number(settings.voiceReviewCheckpoint) || 30);
+      if (t.species.length % cpSize === 0) checkpoint = t.species.length;
+    }
+    return { added: true, checkpoint };
+  },
+
+  readForm() {
+    const t = this.current;
+    t.name = $("#transectName").value.trim() || t.name;
+    t.date = $("#transectDate").value;
+    t.time = $("#transectTime").value;
+    t.lat = $("#transectLat").value;
+    t.lon = $("#transectLon").value;
+    t.alt = $("#transectAlt").value;
+    t.acc = $("#transectAcc").value;
+    t.notes = $("#transectNotes").value;
+  },
+
+  async save() {
+    this.readForm();
+    await Store.saveRecord(this.current);
+    toast("Transect saved", "ok");
+    popView();
+    Home.refresh();
+  },
+
+  async remove() {
+    if (!confirm("Delete this transect? This cannot be undone.")) return;
+    await Store.deleteRecord(this.current.id);
+    toast("Transect deleted");
+    popView();
+    Home.refresh();
+  },
+};
+
+/* ============================================================
+   TRANSECT REVIEW — batch approve/edit/remove unreviewed entries,
+   sorted lowest-certainty first so the ones most likely to need
+   attention surface at the top.
+   ============================================================ */
+
+const TransectReview = {
+  replacingIndex: null,
+
+  open() {
+    this.replacingIndex = null;
+    $("#reviewReplaceBox").hidden = true;
+    this.render();
+    pushView("transect-review");
+  },
+
+  render() {
+    const t = TransectEditor.current;
+    const items = t.species
+      .map((s, i) => ({ s, i }))
+      .filter(x => !x.s.reviewed)
+      .sort((a, b) => (a.s.certainty || 0) - (b.s.certainty || 0));
+
+    $("#reviewCount").textContent = items.length ? items.length : "";
+    const host = $("#reviewList");
+    if (!items.length) {
+      host.innerHTML = `<div class="empty-note">Nothing left to review.</div>`;
+      return;
+    }
+    host.innerHTML = items.map(({ s, i }) => {
+      const pct = Math.round((s.certainty || 0) * 100);
+      const cls = pct >= 85 ? "c-high" : pct >= 50 ? "c-mid" : "c-low";
+      return `
+      <div class="review-row" data-i="${i}">
+        <div class="review-info">
+          <div class="review-name">${esc(s.taxon)}</div>
+          <div class="review-fam">${esc(s.family || "")}</div>
+        </div>
+        <span class="certainty-pill ${cls}">${pct}%</span>
+        <button type="button" class="btn btn-icon review-approve" title="Approve">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 13l4 4L19 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="btn btn-icon review-edit" title="Pick the correct species">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 20h4l10-10-4-4L4 16z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="btn btn-icon review-remove" title="Remove">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>`;
+    }).join("");
+
+    $all(".review-row", host).forEach(row => {
+      const i = Number(row.dataset.i);
+      $(".review-approve", row).addEventListener("click", () => {
+        t.species[i].reviewed = true;
+        this.render(); TransectEditor.renderSpecies();
+      });
+      $(".review-remove", row).addEventListener("click", () => {
+        t.species.splice(i, 1);
+        this.render(); TransectEditor.renderSpecies();
+      });
+      $(".review-edit", row).addEventListener("click", () => { this.startReplace(i); });
+    });
+  },
+
+  startReplace(i) {
+    const t = TransectEditor.current;
+    this.replacingIndex = i;
+    $("#reviewReplaceLabel").textContent = `Replacing: ${t.species[i].taxon}`;
+    $("#reviewReplaceBox").hidden = false;
+    $("#reviewReplaceInput").value = "";
+    $("#reviewReplaceInput").focus();
+  },
+
+  finishReplace(sp) {
+    const t = TransectEditor.current;
+    if (this.replacingIndex == null) return;
+    t.species[this.replacingIndex] = {
+      taxon: sp.t, family: sp.f || "", certainty: 1, reviewed: true, source: "manual", loggedAt: Date.now(),
+    };
+    this.replacingIndex = null;
+    $("#reviewReplaceBox").hidden = true;
+    this.render();
+    TransectEditor.renderSpecies();
+  },
+
+  cancelReplace() {
+    this.replacingIndex = null;
+    $("#reviewReplaceBox").hidden = true;
+  },
+
+  approveAllAbove(threshold) {
+    const t = TransectEditor.current;
+    let n = 0;
+    t.species.forEach(s => { if (!s.reviewed && s.certainty >= threshold) { s.reviewed = true; n++; } });
+    this.render();
+    TransectEditor.renderSpecies();
+    toast(n ? `Approved ${n} taxa` : "Nothing to approve above that threshold");
   },
 };
 
@@ -990,19 +1382,22 @@ const SightingEditor = {
    ============================================================ */
 
 function recordIcon(type) {
-  return type === "releve"
-    ? `<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`
-    : `<svg viewBox="0 0 24 24"><path d="M12 21s-7-5.2-7-10.5C5 6.9 8.1 4 12 4s7 2.9 7 6.5C19 15.8 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="10.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`;
+  if (type === "releve") return `<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+  if (type === "transect") return `<svg viewBox="0 0 24 24"><path d="M3 18c4-8 6 6 10-2 2-4 4-4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="12.2" r="1.4" fill="currentColor"/><circle cx="13.3" cy="14.8" r="1.4" fill="currentColor"/><circle cx="19" cy="11.5" r="1.4" fill="currentColor"/></svg>`;
+  return `<svg viewBox="0 0 24 24"><path d="M12 21s-7-5.2-7-10.5C5 6.9 8.1 4 12 4s7 2.9 7 6.5C19 15.8 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="10.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`;
 }
 
 function recordTitle(rec) {
-  if (rec.type === "releve") return rec.name || "Relevé";
-  return rec.taxon || "Sighting";
+  if (rec.type === "releve" || rec.type === "transect") return rec.name || (rec.type === "releve" ? "Relevé" : "Transect");
+  return rec.taxon || "Observation";
 }
 function recordSub(rec) {
   const bits = [rec.date];
   if (rec.type === "releve") bits.push(`${rec.species.length} spp.`);
-  else if (rec.family) bits.push(rec.family);
+  else if (rec.type === "transect") {
+    const unreviewed = rec.species.filter(s => !s.reviewed).length;
+    bits.push(`${rec.species.length} spp.${unreviewed ? `, ${unreviewed} to review` : ""}`);
+  } else if (rec.family) bits.push(rec.family);
   if (rec.lat && rec.lon) bits.push("GPS");
   return bits.filter(Boolean).join(" · ");
 }
@@ -1016,7 +1411,7 @@ function renderRecordList(records, hostEl) {
     <div class="record-item" data-id="${rec.id}" data-type="${rec.type}">
       <div class="kind">${recordIcon(rec.type)}</div>
       <div class="info">
-        <div class="title" style="${rec.type === "sighting" ? "font-style:italic" : ""}">${esc(recordTitle(rec))}</div>
+        <div class="title" style="${rec.type === "observation" ? "font-style:italic" : ""}">${esc(recordTitle(rec))}</div>
         <div class="sub">${esc(recordSub(rec))}</div>
       </div>
       <div class="chev"><svg viewBox="0 0 24 24" width="18" height="18"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -1026,7 +1421,8 @@ function renderRecordList(records, hostEl) {
     el.addEventListener("click", () => {
       const id = el.dataset.id, type = el.dataset.type;
       if (type === "releve") ReleveEditor.openExisting(id);
-      else SightingEditor.openExisting(id);
+      else if (type === "transect") TransectEditor.openExisting(id);
+      else ObservationEditor.openExisting(id);
     });
   });
 }
@@ -1040,16 +1436,18 @@ const Home = {
     const records = await Store.allRecords();
     records.sort((a, b) => b.updatedAt - a.updatedAt);
     const releveCount = records.filter(r => r.type === "releve").length;
-    const sightingCount = records.filter(r => r.type === "sighting").length;
+    const observationCount = records.filter(r => r.type === "observation").length;
+    const transectCount = records.filter(r => r.type === "transect").length;
     const speciesSet = new Set();
     records.forEach(r => {
-      if (r.type === "releve") r.species.forEach(s => speciesSet.add(s.taxon));
+      if (r.type === "releve" || r.type === "transect") r.species.forEach(s => speciesSet.add(s.taxon));
       else if (r.taxon) speciesSet.add(r.taxon);
     });
 
     $("#homeStats").innerHTML = `
       <div class="stat-card"><div class="n">${releveCount}</div><div class="l">Relevés</div></div>
-      <div class="stat-card"><div class="n">${sightingCount}</div><div class="l">Sightings</div></div>
+      <div class="stat-card"><div class="n">${transectCount}</div><div class="l">Transects</div></div>
+      <div class="stat-card"><div class="n">${observationCount}</div><div class="l">Observations</div></div>
       <div class="stat-card"><div class="n">${speciesSet.size}</div><div class="l">Taxa recorded</div></div>
     `;
 
@@ -1073,6 +1471,8 @@ const Records = {
       if (!q) return true;
       const hay = r.type === "releve"
         ? [r.name, r.habitat, ...r.species.map(s => s.taxon)].join(" ").toLowerCase()
+        : r.type === "transect"
+        ? [r.name, r.notes, ...r.species.map(s => s.taxon)].join(" ").toLowerCase()
         : [r.taxon, r.family, r.notes].join(" ").toLowerCase();
       return hay.includes(q);
     });
@@ -1091,6 +1491,7 @@ const Settings = {
     $("#defaultScaleSelect").value = settings.defaultScale || "bb";
     $("#gpsThresholdInput").value = settings.gpsThreshold || 10;
     $("#voiceSpeakFeedback").checked = settings.voiceSpeakFeedback !== false;
+    $("#voiceReviewCheckpointInput").value = settings.voiceReviewCheckpoint || 30;
 
     $("#speciesPackList").innerHTML = Species.packs.map(p => `
       <div class="tx-item">
@@ -1129,7 +1530,8 @@ function downloadBlob(blob, filename) {
 async function exportCsv() {
   const records = await Store.allRecords();
   const releves = records.filter(r => r.type === "releve");
-  const sightings = records.filter(r => r.type === "sighting");
+  const observations = records.filter(r => r.type === "observation");
+  const transects = records.filter(r => r.type === "transect");
 
   const releveRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "area_m2", "slope_deg", "aspect", "habitat", "cover_tree_pct", "cover_shrub_pct", "cover_herb_pct", "cover_moss_pct", "cover_scale", "species_count", "notes"]];
   const speciesRows = [["releve_id", "releve_name", "taxon", "family", "layer", "cover"]];
@@ -1138,13 +1540,22 @@ async function exportCsv() {
     r.species.forEach(s => speciesRows.push([r.id, r.name, s.taxon, s.family, s.layer, s.cover]));
   });
 
-  const sightingRows = [["id", "taxon", "family", "date", "time", "lat", "lon", "notes"]];
-  sightings.forEach(s => sightingRows.push([s.id, s.taxon, s.family, s.date, s.time, s.lat, s.lon, s.notes]));
+  const observationRows = [["id", "taxon", "family", "date", "time", "lat", "lon", "notes"]];
+  observations.forEach(s => observationRows.push([s.id, s.taxon, s.family, s.date, s.time, s.lat, s.lon, s.notes]));
+
+  const transectRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "species_count", "notes"]];
+  const transectSpeciesRows = [["transect_id", "transect_name", "taxon", "family", "certainty", "reviewed", "source", "logged_at"]];
+  transects.forEach(t => {
+    transectRows.push([t.id, t.name, t.date, t.time, t.lat, t.lon, t.alt, t.acc, t.species.length, t.notes]);
+    t.species.forEach(s => transectSpeciesRows.push([t.id, t.name, s.taxon, s.family, (s.certainty ?? 1).toFixed(2), s.reviewed ? "yes" : "no", s.source || "", s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
+  });
 
   const zipLike = [
     "# releves.csv\n" + toCsv(releveRows),
     "# releves_species.csv\n" + toCsv(speciesRows),
-    "# sightings.csv\n" + toCsv(sightingRows),
+    "# observations.csv\n" + toCsv(observationRows),
+    "# transects.csv\n" + toCsv(transectRows),
+    "# transects_species.csv\n" + toCsv(transectSpeciesRows),
   ].join("\n\n");
 
   downloadBlob(new Blob([zipLike], { type: "text/csv" }), `isurvey-export-${todayDate()}.csv`);
@@ -1214,14 +1625,30 @@ function wireNav() {
 
 function wireHome() {
   $("#newReleveBtn").addEventListener("click", () => ReleveEditor.openNew());
-  $("#newSightingBtn").addEventListener("click", () => SightingEditor.openNew());
+  $("#newObservationBtn").addEventListener("click", () => ObservationEditor.openNew());
+  $("#newTransectBtn").addEventListener("click", () => TransectEditor.openNew());
   $("#seeAllBtn").addEventListener("click", () => { resetToTab("records"); pushView("records"); Records.refresh(); });
+}
+
+function wireTransectEditor() {
+  wireGpsButton($("#transectGpsBtn"), $("#transectGpsStatus"), $("#transectLat"), $("#transectLon"), $("#transectAlt"), $("#transectAcc"));
+  wireAutocomplete($("#transectSearchInput"), $("#transectAcMenu"), sp => TransectEditor.addSpecies(sp));
+  wireVoiceLogging($("#transectVoiceLogBtn"), $("#transectVoiceLogStatus"), "transect", (sp, opts) => TransectEditor.addSpecies(sp, opts));
+  $("#transectReviewBtn").addEventListener("click", () => TransectReview.open());
+  $("#transectSaveBtn").addEventListener("click", () => TransectEditor.save());
+  $("#transectDeleteBtn").addEventListener("click", () => TransectEditor.remove());
+}
+
+function wireTransectReview() {
+  wireAutocomplete($("#reviewReplaceInput"), $("#reviewReplaceMenu"), sp => TransectReview.finishReplace(sp));
+  $("#reviewReplaceCancelBtn").addEventListener("click", () => TransectReview.cancelReplace());
+  $("#reviewApproveAllBtn").addEventListener("click", () => TransectReview.approveAllAbove(0.9));
 }
 
 function wireReleveEditor() {
   wireGpsButton($("#releveGpsBtn"), $("#releveGpsStatus"), $("#releveLat"), $("#releveLon"), $("#releveAlt"), $("#releveAcc"));
   wireAutocomplete($("#speciesSearchInput"), $("#speciesAcMenu"), sp => ReleveEditor.addSpecies(sp));
-  wireVoiceLogging($("#voiceLogBtn"), $("#voiceLogStatus"), (sp, opts) => ReleveEditor.addSpecies(sp, opts));
+  wireVoiceLogging($("#voiceLogBtn"), $("#voiceLogStatus"), "releve", (sp, opts) => ReleveEditor.addSpecies(sp, opts));
   $("#coverScaleSelect").addEventListener("change", () => {
     ReleveEditor.current.coverScale = $("#coverScaleSelect").value;
     ReleveEditor.renderSpecies();
@@ -1231,13 +1658,13 @@ function wireReleveEditor() {
   $("#releveDeleteBtn").addEventListener("click", () => ReleveEditor.remove());
 }
 
-function wireSightingEditor() {
-  wireGpsButton($("#sightingGpsBtn"), $("#sightingGpsStatus"), $("#sightingLat"), $("#sightingLon"), null, null);
-  wireAutocomplete($("#sightingTaxonInput"), $("#sightingAcMenu"), sp => SightingEditor.setTaxon(sp));
-  wireDictation($("#sightingDictateBtn"), $("#sightingTaxonInput"), $("#sightingAcMenu"), $("#sightingDictateStatus"), sp => SightingEditor.setTaxon(sp));
-  $("#sightingPhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, SightingEditor.current.photoIds, $("#sightingPhotos")));
-  $("#sightingSaveBtn").addEventListener("click", () => SightingEditor.save());
-  $("#sightingDeleteBtn").addEventListener("click", () => SightingEditor.remove());
+function wireObservationEditor() {
+  wireGpsButton($("#observationGpsBtn"), $("#observationGpsStatus"), $("#observationLat"), $("#observationLon"), null, null);
+  wireAutocomplete($("#observationTaxonInput"), $("#observationAcMenu"), sp => ObservationEditor.setTaxon(sp));
+  wireDictation($("#observationDictateBtn"), $("#observationTaxonInput"), $("#observationAcMenu"), $("#observationDictateStatus"), sp => ObservationEditor.setTaxon(sp));
+  $("#observationPhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, ObservationEditor.current.photoIds, $("#observationPhotos")));
+  $("#observationSaveBtn").addEventListener("click", () => ObservationEditor.save());
+  $("#observationDeleteBtn").addEventListener("click", () => ObservationEditor.remove());
 }
 
 function wireRecords() {
@@ -1263,6 +1690,12 @@ function wireSettings() {
     s.voiceSpeakFeedback = $("#voiceSpeakFeedback").checked;
     await Store.saveSettings(s);
   });
+  $("#voiceReviewCheckpointInput").addEventListener("change", async () => {
+    const s = await Store.getSettings();
+    s.voiceReviewCheckpoint = Math.max(5, Number($("#voiceReviewCheckpointInput").value) || 30);
+    $("#voiceReviewCheckpointInput").value = s.voiceReviewCheckpoint;
+    await Store.saveSettings(s);
+  });
   $("#exportCsvBtn").addEventListener("click", () => exportCsv());
   $("#exportJsonBtn").addEventListener("click", () => exportJson());
   $("#importJsonInput").addEventListener("change", async e => {
@@ -1273,7 +1706,7 @@ function wireSettings() {
     e.target.value = "";
   });
   $("#wipeDataBtn").addEventListener("click", async () => {
-    if (!confirm("Erase ALL local data — every relevé, sighting and photo? This cannot be undone.")) return;
+    if (!confirm("Erase ALL local data — every relevé, observation and photo? This cannot be undone.")) return;
     await Store.wipeAll();
     toast("All data erased");
     Home.refresh();
@@ -1294,7 +1727,7 @@ function wireNetStatus() {
 }
 
 async function init() {
-  wireNav(); wireHome(); wireReleveEditor(); wireSightingEditor(); wireRecords(); wireSettings(); wireNetStatus();
+  wireNav(); wireHome(); wireReleveEditor(); wireObservationEditor(); wireTransectEditor(); wireTransectReview(); wireRecords(); wireSettings(); wireNetStatus();
   showView("home");
   try {
     await Species.loadAll();

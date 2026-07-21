@@ -25,7 +25,33 @@ import {
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const MODEL_ID = "Xenova/whisper-tiny";
+// Two model sizes, chosen in Settings. tiny is ~40 MB and fast; base is
+// ~77 MB and markedly more accurate on the unusual (Latin) words this app
+// lives on — the default, since near-perfect recognition is the point and
+// the download happens once. Both work through the identical code path
+// below because the decoder-cache tensor shapes are read from each model's
+// config at load time rather than hard-coded.
+const QUALITY_MODELS = { fast: "Xenova/whisper-tiny", accurate: "Xenova/whisper-base" };
+let MODEL_ID = QUALITY_MODELS.accurate;
+
+// Change the model size to load. Ignored once a model is already loaded for
+// this session (takes effect on the next page load) — swapping a loaded ONNX
+// session mid-session isn't worth the complexity here.
+function setQuality(q) {
+  if (state.loaded || state.loading) return;
+  MODEL_ID = QUALITY_MODELS[q] || QUALITY_MODELS.accurate;
+}
+
+// Beam width for the free transcript. Beam search yields a better single
+// transcript than greedy on the unusual multi-syllable words this app lives
+// on (worth the extra decode time), which in turn means the true species is
+// more likely to land in the text shortlist that gets audio-rescored. (This
+// pinned transformers.js build only ever returns the single best beam even
+// when more are requested, so the shortlist is built from that one transcript
+// plus the phonetic/fuzzy expansion the matcher already does — the heavy
+// lifting for accuracy is the audio rescoring + acoustic/text blend, not
+// transcript diversity.)
+const BEAM_WIDTH = 4;
 
 // Dictation language for both the free transcript and every candidate score
 // — fixed rather than auto-detected. Whisper's own language auto-detection
@@ -42,6 +68,7 @@ const state = {
   processor: null,
   model: null,
   promptIds: null, // [<|startoftranscript|>, <|LANG|>, <|transcribe|>, <|notimestamps|>]
+  dims: null,      // { layers, heads, headDim } — read from the loaded model's config
 };
 
 async function loadModel(onProgress) {
@@ -60,6 +87,13 @@ async function loadModel(onProgress) {
     state.model = await WhisperForConditionalGeneration.from_pretrained(MODEL_ID, { ...opts, quantized: true });
     const tok = s => state.tokenizer.model.tokens_to_ids.get(s);
     state.promptIds = [tok("<|startoftranscript|>"), tok(`<|${LANG}|>`), tok("<|transcribe|>"), tok("<|notimestamps|>")];
+    // Decoder KV-cache placeholder tensors (below) must match THIS model's
+    // shape, which differs by size (tiny: 4 layers / 6 heads; base: 6 / 8),
+    // so read it from the config instead of hard-coding one model's numbers.
+    const c = state.model.config;
+    const layers = c.decoder_layers || c.num_hidden_layers;
+    const heads = c.decoder_attention_heads;
+    state.dims = { layers, heads, headDim: Math.round(c.d_model / heads) };
     state.loaded = true;
   })();
   try {
@@ -205,17 +239,26 @@ async function startContinuousCapture(onSegment) {
 // and model.sessions.decoder_model_merged (decoder) — which is the one path
 // verified to work correctly end-to-end.
 
-const N_LAYERS = 4, N_HEADS = 6, HEAD_DIM = 64; // whisper-tiny architecture
-
 async function runEncoder(inputFeatures) {
   const out = await state.model.sessions.model.run({ input_features: inputFeatures });
   return out.last_hidden_state;
 }
 
-async function freeTranscript(inputFeatures) {
-  const out = await state.model.generate({ input_features: inputFeatures, language: LANG, task: "transcribe", max_new_tokens: 64 });
-  const text = state.tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || "";
-  return text.trim();
+// Decode the free transcript for one utterance via beam search. A species
+// name is short, so max_new_tokens is kept tight (faster, and it can't run
+// off into a sentence). Returned as a one-element array so callers can treat
+// it uniformly as a set of shortlist seeds.
+async function decodeHypotheses(inputFeatures) {
+  const out = await state.model.generate({
+    input_features: inputFeatures,
+    language: LANG,
+    task: "transcribe",
+    max_new_tokens: 32,
+    num_beams: BEAM_WIDTH,
+    num_return_sequences: 1,
+  });
+  const text = (state.tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || "").trim();
+  return [text];
 }
 
 // One decoder forward pass over prompt + candidate + <|endoftext|>, teacher-
@@ -233,10 +276,11 @@ function decoderInputsFor(seq, encoderHidden) {
   // "If" node branches on use_cache_branch at runtime) — ORT still requires
   // every declared input to be supplied, so these are zero-length placeholders
   // for the not-taken "with cache" branch, not real cached state.
-  for (let i = 0; i < N_LAYERS; i++) {
+  const { layers, heads, headDim } = state.dims;
+  for (let i = 0; i < layers; i++) {
     for (const who of ["decoder", "encoder"]) {
       for (const kv of ["key", "value"]) {
-        inputs[`past_key_values.${i}.${who}.${kv}`] = new Tensor("float32", new Float32Array(0), [1, N_HEADS, 0, HEAD_DIM]);
+        inputs[`past_key_values.${i}.${who}.${kv}`] = new Tensor("float32", new Float32Array(0), [1, heads, 0, headDim]);
       }
     }
   }
@@ -278,8 +322,12 @@ async function transcribeAudio(pcm16k) {
   // reentrancy) — processed once, then the two model passes run in sequence.
   const { input_features } = await state.processor(pcm16k);
   const encoderHidden = await runEncoder(input_features);
-  const transcript = await freeTranscript(input_features);
-  return { transcript, encoderHandle: encoderHidden };
+  const hypotheses = await decodeHypotheses(input_features);
+  // `transcript` is the display/status string; `hypotheses` is the (currently
+  // single-element) set of seeds the caller feeds to its fuzzy shortlist — an
+  // array so the shortlist step stays identical if multi-hypothesis decoding
+  // becomes available in a future library version.
+  return { transcript: hypotheses[0], hypotheses, encoderHandle: encoderHidden };
 }
 
 // Step 2: rescore a shortlist of candidate taxon names against the audio
@@ -298,6 +346,7 @@ async function rescoreCandidates(encoderHandle, candidateTexts) {
 window.WhisperVoice = {
   isSupported,
   isLoaded: () => state.loaded,
+  setQuality,
   loadModel,
   startRecording,
   stopRecording,

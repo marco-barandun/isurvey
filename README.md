@@ -67,6 +67,15 @@ recording, adapted to stay local/offline:
 - **Map with a layer switcher** — Swisstopo topographic and aerial imagery,
   plus OpenStreetMap for outside Switzerland, shown under each captured GPS
   point (see below).
+- **Species entry comes first** — opening a relevé lands you straight on the
+  voice-logging button and the species search; the one-time plot setup (cover
+  scale, assessment method) sits in a collapsed "Recording setup" sub-section
+  so it never buries the actual field work.
+- **Inline help (ⓘ)** — small circular info buttons sit next to anything that
+  benefits from a word of explanation — cover-abundance scales (with a visual
+  of the classes), GPS averaging, voice logging, the transect certainty/review
+  flow, nested sampling. Tap one for a short, self-contained explanation
+  without leaving the field screen.
 
 Deliberately **not** carried over, since they need a server, an account, or
 data this app doesn't have: live tracklog recording/GPX export, sync to an
@@ -266,17 +275,23 @@ plausible candidate name — "how well does this recording match exactly
 [Whisper](https://github.com/openai/whisper) speech model
 ([transformers.js](https://github.com/huggingface/transformers.js),
 vendored — no CDN at runtime). Concretely, per utterance: the audio is
-transcribed once to get a rough guess, that guess narrows the ~4,200-taxon
-checklist down to a short list of plausible candidates via the same
-phonetic/fuzzy matcher described above, and then each of those candidates
-is teacher-force-scored straight from the audio's acoustic encoding — so
-the final pick is chosen by the acoustic model itself, not by how close
-its guessed text happens to look like a real name.
+transcribed (beam search) to get a rough guess; that guess narrows the
+~4,200-taxon checklist down to a short list of plausible candidates via the
+same phonetic/fuzzy matcher described above; each of those candidates is then
+teacher-force-scored straight from the audio's acoustic encoding; and the
+final pick **blends the acoustic score with the text-match score**, so the
+winner has to satisfy both the recording *and* the spelling. That blend is
+what kills most near-homophone confusions a text-only or audio-only pick
+makes on its own — the accuracy of the feature rides on it.
 
-**Setup**: enabling it downloads the model (~40 MB) from Hugging Face over
-a connection, once — the same "needs network" carve-out voice dictation
-already has. After that it's cached by the browser and runs fully
-on-device and offline, like the rest of the app.
+**Setup**: enabling it downloads the model from Hugging Face over a
+connection, once — the same "needs network" carve-out voice dictation already
+has. After that it's cached by the browser and runs fully on-device and
+offline, like the rest of the app. **Model size** is a setting: the default
+**base** model (~77 MB) is markedly more accurate on the unusual Latin names
+this app depends on, and a **tiny** model (~40 MB, faster, less accurate) is
+available if download size or per-utterance speed matters more. Changing the
+size takes effect on the next app reload.
 
 **Covers both dictation and voice logging.** Once enabled, it also replaces
 the engine behind **"Start voice logging"** on a relevé or transect: instead

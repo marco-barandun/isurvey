@@ -25,6 +25,15 @@ function nowTime() {
 }
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+// Update a button's own label text without disturbing sibling children (icon,
+// nested info-dot). Targets the first non-empty direct text node rather than
+// btn.lastChild, since an inline (i) dot is often the actual last child now.
+function setBtnLabel(btn, text) {
+  for (const n of btn.childNodes) {
+    if (n.nodeType === Node.TEXT_NODE && n.textContent.trim()) { n.textContent = text; return; }
+  }
+  btn.insertBefore(document.createTextNode(text), btn.firstChild);
+}
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -120,7 +129,7 @@ const Store = {
   deletePhoto: id => idbDelete("photos", id),
   allPhotos: () => idbAll("photos"),
   getSettings: () => idbGet("settings", "app").then(s =>
-    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30, aiVoiceEnabled: false }, s || {})),
+    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30, aiVoiceEnabled: false, aiVoiceQuality: "accurate" }, s || {})),
   saveSettings: s => { s.key = "app"; return idbPut("settings", s); },
   wipeAll: () => Promise.all([idbClear("records"), idbClear("photos"), idbClear("settings")]),
 };
@@ -454,7 +463,7 @@ function wireGpsButton(btn, statusEl, latEl, lonEl, altEl, accEl, viewName) {
 
   btn.addEventListener("click", () => { if (active) cancel(); else start(); });
   function setBtnState(capturing) {
-    btn.lastChild.textContent = capturing ? " Cancel locating…" : " Capture GPS location (averaged)";
+    setBtnLabel(btn, capturing ? "Cancel locating…" : "Capture GPS location (averaged)");
     btn.classList.toggle("btn-danger", capturing);
   }
   if (viewName) addLeaveHook(viewName, cancel);
@@ -820,24 +829,27 @@ async function runAiDictation(inputEl, menuEl, setStatus, onPick) {
     const blob = await AiVoice._pendingRecording;
     AiVoice._pendingRecording = null;
     const pcm = await AiVoice.mod.blobToPCM16k(blob);
-    const { transcript, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
+    const { transcript, hypotheses, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
     if (!transcript || transcript.length < 2) { setStatus("Didn't catch that — type it instead."); return; }
-    const shortlist = fuzzyMatchTranscripts([transcript], 40);
-    if (!shortlist.length) {
+    // Larger shortlist than the walking path — a one-off lookup can afford the
+    // extra rescoring passes for maximum recall.
+    const result0 = await aiRankUtterance(hypotheses, encoderHandle, 30);
+    if (!result0) {
       inputEl.value = transcript;
       inputEl.dispatchEvent(new Event("input"));
       inputEl.focus();
       setStatus(`Heard "${transcript}" — not in the checklist, typed as-is`);
       return;
     }
-    const textToSp = new Map(shortlist.map(m => [m.sp.t, m.sp]));
-    const ranked = await AiVoice.mod.rescoreCandidates(encoderHandle, [...textToSp.keys()]);
-    const top = textToSp.get(ranked[0].text);
+    const top = result0.ranked[0].sp;
     inputEl.value = top.t;
     inputEl.dispatchEvent(new Event("input"));
     inputEl.focus();
     setStatus(`Heard "${transcript}" → ${top.t}`);
-    const menuMatches = ranked.slice(0, 5).map(r => ({ sp: textToSp.get(r.text), score: r.score }));
+    // Always also show the top few as a tap-to-pick list — audio matching is
+    // strong but not infallible on near-homophone names, and one tap to the
+    // runner-up is faster than retyping.
+    const menuMatches = result0.ranked.slice(0, 5).map(r => ({ sp: r.sp, score: r.final }));
     renderVoiceCandidates(menuEl, menuMatches, sp => { onPick(sp); setStatus(""); });
   } catch (e) {
     console.error(e);
@@ -938,13 +950,45 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
 /* each recognized name is matched and added automatically     */
 /* ---------------------------------------------------------- */
 
-// AI-mode candidate scores are log-likelihood margins (unbounded, ≥0), not
-// the Web Speech path's native 0–1 confidence — squashed here into the same
-// 0–1 range addSpecies()/the certainty-pill UI expect, calibrated so a clear
-// audio winner lands above VOICE_HIGH_CONF and a close call sits below it.
-function aiConfidenceFromMargin(margin) {
-  if (margin == null) return 0.9; // no runner-up to be uncertain against
-  return 0.5 + 0.48 * (1 - Math.exp(-Math.max(0, margin) * 1.5));
+// --- AI candidate ranking (shared by single-field dictation and continuous
+// voice logging). The accuracy of the whole feature rides on this: rather
+// than trusting the transcript's TEXT, it (1) builds a generous text shortlist
+// (phonetic + fuzzy) from the transcript so the true name is very likely to be
+// somewhere in it, (2) rescores that shortlist directly against the recorded
+// AUDIO — asking the model how well the recording matches each exact name —
+// and (3) blends the acoustic score with the text score so the final pick has
+// to satisfy BOTH the recording and the spelling, which kills most of the
+// near-homophone confusions a text-only or audio-only pick makes on its own.
+const AI_BLEND_ACOUSTIC = 0.65;   // audio is the primary signal
+const AI_BLEND_TEXT = 0.35;       // spelling as a sanity check / tiebreak
+const AI_ACOUSTIC_TEMP = 0.4;     // sharpness of acoustic→[0,1] normalisation
+
+async function aiRankUtterance(hypotheses, encoderHandle, shortlistSize) {
+  // fuzzyMatchTranscripts keeps the best text score per taxon across every
+  // string handed to it (one today; ready for several if multi-hypothesis
+  // decoding returns).
+  const shortlist = fuzzyMatchTranscripts(hypotheses, shortlistSize);
+  if (!shortlist.length) return null;
+  const spByText = new Map(shortlist.map(m => [m.sp.t, m.sp]));
+  const textScore = new Map(shortlist.map(m => [m.sp.t, m.score]));
+  const acoustic = await AiVoice.mod.rescoreCandidates(encoderHandle, [...spByText.keys()]);
+  const maxA = acoustic[0].score; // rescoreCandidates returns sorted desc
+  const ranked = acoustic.map(a => {
+    const aNorm = Math.exp((a.score - maxA) / AI_ACOUSTIC_TEMP); // winner = 1
+    const text = textScore.get(a.text) || 0;
+    return { sp: spByText.get(a.text), acoustic: a.score, text, final: AI_BLEND_ACOUSTIC * aNorm + AI_BLEND_TEXT * text };
+  });
+  ranked.sort((x, y) => y.final - x.final);
+  const margin = ranked[1] ? ranked[0].final - ranked[1].final : null;
+  return { ranked, margin };
+}
+
+// Blended-margin → 0–1 confidence on the same scale addSpecies()/the
+// certainty-pill UI expect. A clear winner that both signals agree on lands
+// above VOICE_HIGH_CONF; a close call sits below it and is flagged to confirm.
+function aiConfidence(topFinal, margin) {
+  const clarity = margin == null ? 1 : Math.min(1, margin / 0.35);
+  return Math.max(0, Math.min(0.98, 0.5 * topFinal + 0.5 * clarity));
 }
 
 // Handles one VAD-captured utterance in AI voice-logging mode: transcribe,
@@ -955,17 +999,16 @@ function aiConfidenceFromMargin(margin) {
 async function handleAiVoiceSegment(blob, addSpecies, setStatus, speakFeedback) {
   try {
     const pcm = await AiVoice.mod.blobToPCM16k(blob);
-    const { transcript, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
+    const { transcript, hypotheses, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
     const heard = (transcript || "").trim();
     if (heard.length < 3) return; // breath/noise while walking — not worth interrupting for
 
-    // Kept shorter than the single-field dictation path's shortlist (40) —
-    // each candidate here costs its own decoder forward pass (~1s), and
-    // this runs mid-walk where latency matters more than squeezing out a
-    // little extra shortlist coverage; the text pre-filter already ranks
-    // genuinely close matches near the top.
-    const shortlist = fuzzyMatchTranscripts([heard], 15);
-    if (!shortlist.length) {
+    // Shortlist kept smaller here (vs. dictation's larger list) because each
+    // candidate costs its own decoder pass and this runs mid-walk where
+    // latency matters more; the base model's transcript is usually good
+    // enough that the true name sits near the top of the text shortlist.
+    const result0 = await aiRankUtterance(hypotheses, encoderHandle, 18);
+    if (!result0) {
       const sp = { t: heard.charAt(0).toUpperCase() + heard.slice(1), f: "", freeText: true };
       const result = await addSpecies(sp, { unconfirmed: true, silent: true });
       if (result && result.added !== false) {
@@ -981,11 +1024,9 @@ async function handleAiVoiceSegment(blob, addSpecies, setStatus, speakFeedback) 
       return;
     }
 
-    const textToSp = new Map(shortlist.map(m => [m.sp.t, m.sp]));
-    const ranked = await AiVoice.mod.rescoreCandidates(encoderHandle, [...textToSp.keys()]);
-    const certainty = aiConfidenceFromMargin(ranked[1] ? ranked[0].score - ranked[1].score : null);
+    const certainty = aiConfidence(result0.ranked[0].final, result0.margin);
     const confident = certainty >= VOICE_HIGH_CONF;
-    const sp = textToSp.get(ranked[0].text);
+    const sp = result0.ranked[0].sp;
 
     const result = await addSpecies(sp, { unconfirmed: !confident, score: certainty, silent: true });
     if (!result || result.added === false) { setStatus(`Already logged: ${sp.t}`); return; }
@@ -1040,7 +1081,7 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
   function setStatus(t) { if (statusEl) statusEl.textContent = t || ""; }
   function setBtnState() {
     btn.classList.toggle("listening", active);
-    btn.lastChild.textContent = active ? " Stop voice logging" : " Start voice logging";
+    setBtnLabel(btn, active ? "Stop voice logging" : "Start voice logging");
   }
   function startSession() {
     if (!active || running) return;
@@ -1182,6 +1223,108 @@ function wireInfoModal() {
   $("#infoModalClose").addEventListener("click", closeInfoModal);
   $("#infoModal").addEventListener("click", e => { if (e.target.id === "infoModal") closeInfoModal(); });
   document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#infoModal").hidden) closeInfoModal(); });
+  // One delegated handler for every inline "i" dot in the app. stopPropagation
+  // + preventDefault so a dot nested inside a button (GPS/voice) or a <summary>
+  // opens its help instead of triggering that control or toggling the fold.
+  const openDotTopic = dot => {
+    const topic = INFO_TOPICS[dot.getAttribute("data-info")];
+    if (topic) openInfoModal(topic.title, topic.html);
+  };
+  document.addEventListener("click", e => {
+    const dot = e.target.closest(".info-dot[data-info]");
+    if (!dot) return;
+    e.preventDefault(); e.stopPropagation();
+    openDotTopic(dot);
+  });
+  // The dots are spans with role=button (so they can nest legally inside real
+  // buttons/summaries) — wire keyboard activation to match a real button.
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const dot = e.target.closest && e.target.closest(".info-dot[data-info]");
+    if (!dot) return;
+    e.preventDefault(); e.stopPropagation();
+    openDotTopic(dot);
+  });
+}
+
+/* Inline-help content for the (i) dots scattered through the editors. Kept
+   here as one registry so the same explanation is reused everywhere a concept
+   appears, and so the wording lives next to the code it describes. Small SVGs
+   use currentColor so they follow the light/dark theme. */
+const INFO_TOPICS = {
+  voiceModes: {
+    title: "Voice logging & dictation",
+    html: `
+      <p><strong>Two ways to add species by voice:</strong></p>
+      <p>• <strong>Dictate one name</strong> — the mic button next to a search box listens for a single species, matches it, and fills it in.</p>
+      <p>• <strong>Start voice logging</strong> — hands-free continuous mode for walking a plot or line: leave it on and call out each species as you spot it. Confident matches are added straight away; unsure ones are still added but flagged for you to check.</p>
+      <p>Latin names are never trusted as raw text — every phrase is matched against the whole checklist by sound and spelling, so a mangled "dro sarah" still resolves to <em>Drosera</em>.</p>
+      <p><strong>Near-perfect mode:</strong> turn on <em>Settings → AI-enhanced voice matching</em> to run an on-device speech model that scores the actual audio against each candidate name — markedly better on Latin names, at the cost of a few seconds per species. Standard dictation needs a connection; the AI model works offline once downloaded.</p>`,
+  },
+  speciesSearch: {
+    title: "Adding species by typing",
+    html: `
+      <p>Type an <strong>abbreviation of each word</strong> — <code>dro rot</code> finds <em>Drosera rotundifolia</em>, <code>dact fuch</code> finds <em>Dactylorhiza maculata</em> subsp. <em>fuchsii</em>. Words match in order; you can skip rank markers like subsp./var.</p>
+      <p>If nothing in the checklist fits (a hybrid, a "Carex sp.", your own wording), the dropdown always offers <strong>Add "…" as typed</strong> at the bottom — it's kept and flagged <em>not in checklist</em>.</p>
+      <p><strong>Wrong match?</strong> Tap any species name already in the list to re-pick it from the top candidates or retype it.</p>`,
+  },
+  coverScale: {
+    title: "Cover-abundance scales",
+    html: `
+      <p>How each species' abundance is recorded. Set once per plot; every species row then uses it.</p>
+      <p><strong>Braun-Blanquet</strong> — the classic 7-point scale. <code>r</code> = one or few individuals, <code>+</code> = few, small cover; then <code>1–5</code> by increasing cover:</p>
+      ${coverScaleSvg()}
+      <p><strong>Braun-Blanquet extended</strong> — splits class 2 into <code>2m / 2a / 2b</code> for finer low-cover resolution.</p>
+      <p><strong>Percentage cover</strong> — enter a direct 0–100 % estimate instead of a class. Best when you want continuous values for analysis.</p>`,
+  },
+  gps: {
+    title: "GPS capture",
+    html: `
+      <p>Capture <strong>averages up to 10 satellite fixes</strong> and keeps only those at or below your accuracy threshold (<em>Settings → GPS precision threshold</em>, default 10 m), then shows the point on a small map with a shaded circle for its real accuracy:</p>
+      ${gpsAccuracySvg()}
+      <p>On a new record it starts automatically — fixing the location is the first thing that happens, then the section collapses so the species list takes over. Tap the button again any time to re-capture.</p>
+      <p>Only the map <em>tiles</em> need a connection; your coordinates are saved locally either way.</p>`,
+  },
+  transectReview: {
+    title: "Certainty & Review",
+    html: `
+      <p>Every transect entry carries a <strong>certainty score</strong>: manual picks are 100 %; voice-logged entries carry the real match confidence, shown as a coloured pill. Low-confidence entries start unreviewed.</p>
+      <p><strong>Review &amp; approve</strong> lists the unreviewed ones, lowest certainty first, with one tap each to approve, swap in the right species, or discard a false catch. There's also a bulk "approve all ≥ 90 %".</p>
+      <p>While voice logging you get a gentle nudge every N taxa (<em>Settings</em>) as a natural point to review — but you can review whenever suits.</p>`,
+  },
+  nested: {
+    title: "Nested sampling",
+    html: `
+      <p>Optional. Records each species by the <strong>smallest sub-plot area it first appears in</strong>, to build a species-area curve — off by default; the species list works the same either way.</p>
+      <p><strong>Geometry:</strong> <em>centre-out</em> grows concentric squares from one point; <em>corner-based</em> nests from two opposite plot corners (the EDGG style).</p>
+      <p><strong>Area progression:</strong> the sequence of sub-plot sizes — EDGG's standard 9-step series, a classic ×4 nested-quadrat series, or your own custom list of areas.</p>
+      <p>When on, each species row gains a grain-size picker (labelled by real edge length, e.g. "3.16 m" for 10 m²).</p>`,
+  },
+};
+
+// Small theme-aware visuals used inside the info topics above.
+function coverScaleSvg() {
+  const classes = [["r", 2], ["+", 4], ["1", 10], ["2", 20], ["3", 37], ["4", 62], ["5", 87]];
+  const w = 300, barW = 34, gap = 6, h = 98, base = 66;
+  const bars = classes.map(([lbl, pct], i) => {
+    const x = 8 + i * (barW + gap);
+    const bh = Math.max(4, (pct / 100) * 52);
+    return `<rect x="${x}" y="${base - bh}" width="${barW}" height="${bh}" rx="2" fill="currentColor" opacity="${0.25 + i * 0.1}"/>
+      <text x="${x + barW / 2}" y="${base + 12}" font-size="11" font-weight="700" fill="currentColor" text-anchor="middle">${lbl}</text>
+      <text x="${x + barW / 2}" y="${base - bh - 4}" font-size="8" fill="currentColor" text-anchor="middle" opacity="0.7">${pct}%</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">${bars}
+    <text x="8" y="${base + 26}" font-size="9" fill="currentColor" opacity="0.6">approx. mid cover of each class</text></svg>`;
+}
+function gpsAccuracySvg() {
+  return `<svg viewBox="0 0 200 120" style="width:100%;max-width:200px;height:auto;display:block;margin:6px auto">
+    <circle cx="100" cy="60" r="46" fill="currentColor" opacity="0.10"/>
+    <circle cx="100" cy="60" r="46" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>
+    <circle cx="100" cy="60" r="5" fill="currentColor"/>
+    <line x1="100" y1="60" x2="146" y2="60" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+    <text x="120" y="52" font-size="10" fill="currentColor" opacity="0.8">± accuracy</text>
+    <text x="100" y="112" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.6">point is never more precise than the circle</text>
+  </svg>`;
 }
 
 /* ============================================================
@@ -1910,7 +2053,9 @@ const TransectEditor = {
     $("#transectListStatus").textContent = t.species.length
       ? `${t.species.length} logged · ${unreviewed} awaiting review`
       : "";
-    $("#transectReviewBtn").textContent = unreviewed ? `Review & approve (${unreviewed})` : "Review & approve";
+    // Update only the label span, not the button's whole textContent — the
+    // latter would wipe the nested (i) info dot that lives inside the button.
+    $("#transectReviewLabel").textContent = unreviewed ? `Review & approve (${unreviewed})` : "Review & approve";
 
     const host = $("#transectSpeciesTable");
     if (!t.species.length) {
@@ -2605,6 +2750,8 @@ const AiVoice = {
         this.setStatus(this.error);
         return false;
       }
+      const settings = await Store.getSettings();
+      mod.setQuality(settings.aiVoiceQuality || "accurate");
       this.setStatus("Preparing…");
       await mod.loadModel(p => {
         if (p && p.status === "progress" && p.total) {
@@ -2630,6 +2777,7 @@ const AiVoice = {
   async refreshStatus() {
     const settings = await Store.getSettings();
     $("#aiVoiceEnabled").checked = !!settings.aiVoiceEnabled;
+    if ($("#aiVoiceQuality")) $("#aiVoiceQuality").value = settings.aiVoiceQuality || "accurate";
     if (!settings.aiVoiceEnabled) { this.setStatus(""); $("#aiVoiceDownloadBtn").hidden = true; return; }
     if (this.mod && this.mod.isLoaded()) { this.setStatus("Ready — on-device voice matching is active."); return; }
     if (this.error) { this.setStatus(this.error); $("#aiVoiceDownloadBtn").hidden = false; return; }
@@ -2972,6 +3120,14 @@ function wireSettings() {
     await AiVoice.refreshStatus();
   });
   $("#aiVoiceDownloadBtn").addEventListener("click", () => AiVoice.ensureLoaded());
+  $("#aiVoiceQuality").addEventListener("change", async () => {
+    const s = await Store.getSettings();
+    s.aiVoiceQuality = $("#aiVoiceQuality").value;
+    await Store.saveSettings(s);
+    if (AiVoice.mod && AiVoice.mod.isLoaded()) {
+      AiVoice.setStatus("Model size changes take effect after you reload the app.");
+    }
+  });
   $("#exportCsvBtn").addEventListener("click", () => exportCsv());
   $("#exportJsonBtn").addEventListener("click", () => exportJson());
   $("#importJsonInput").addEventListener("change", async e => {

@@ -195,6 +195,27 @@ textarea.input { resize: vertical; }
 }
 .method-info-btn:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-line); }
 
+/* Inline "i" help dot — reused via [data-info] beside labels and inside
+   buttons/summaries throughout the editors. */
+.info-dot {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 17px; height: 17px; border-radius: 50%; padding: 0;
+  border: 1px solid var(--hair-strong); background: var(--surface); color: var(--muted);
+  font-size: 10px; font-weight: 700; font-style: italic; font-family: Georgia, serif; line-height: 1;
+  cursor: pointer; vertical-align: middle; margin-left: 5px; flex: none;
+}
+.info-dot:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-line); }
+/* Inside a full-width button (voice/GPS/Review) the dot floats at the right
+   edge rather than participating in the centred flex row, so the button's
+   label stays centred and the dot never wraps. */
+.btn { position: relative; }
+.btn .info-dot {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%); margin-left: 0;
+  border-color: var(--hair-strong); background: var(--surface); color: var(--muted); opacity: 0.9;
+}
+.btn .info-dot:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-line); opacity: 1; }
+.info-dot:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+
 /* ============================ app / views ============================ */
 .app { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 12px); min-height: calc(100vh - var(--bar-h)); }
 .view { display: none; }

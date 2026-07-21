@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="styles.css?v=22">
+  <link rel="stylesheet" href="styles.css?v=24">
   <link rel="stylesheet" href="vendor/leaflet.css">
   <script>
     (() => { try { const t = localStorage.getItem("isurvey.theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch {} })();
@@ -110,24 +110,15 @@
         <details class="fold" open>
           <summary>Species list <span id="speciesCount" class="tag"></span></summary>
           <div class="fold-body">
-            <label class="field-label" for="coverScaleSelect">Cover-abundance scale</label>
-            <select id="coverScaleSelect" class="input">
-              <option value="bb">Braun-Blanquet (r + 1 2 3 4 5)</option>
-              <option value="bb-ext">Braun-Blanquet extended (r + 1 2m 2a 2b 3 4 5)</option>
-              <option value="pct">Percentage cover</option>
-            </select>
-
-            <div class="field-label" style="margin-top:10px">Cover assessment method <span class="tag">tap ⓘ for details</span></div>
-            <div id="methodPicker" class="method-grid"></div>
-
-            <button type="button" id="voiceLogBtn" class="btn full voice-log-btn" style="margin-top:12px" hidden>
+            <button type="button" id="voiceLogBtn" class="btn full voice-log-btn" hidden>
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Start voice logging
+              <span class="info-dot" role="button" tabindex="0" data-info="voiceModes" aria-label="About voice logging">i</span>
             </button>
             <div id="voiceLogStatus" class="hint"></div>
 
             <div class="ac-wrap" style="margin-top:12px">
-              <label class="field-label" for="speciesSearchInput">Add species manually</label>
+              <label class="field-label" for="speciesSearchInput">Add species manually <span class="info-dot" role="button" tabindex="0" data-info="speciesSearch" aria-label="About species search">i</span></label>
               <input id="speciesSearchInput" class="input" autocomplete="off" placeholder="Type to search — e.g. dro rot for Drosera rotundifolia">
               <div id="speciesAcMenu" class="ac-menu"></div>
             </div>
@@ -150,11 +141,26 @@
               <div id="speciesCorrectorMenu" class="ac-menu"></div>
               <button type="button" id="speciesCorrectorCancelBtn" class="btn btn-ghost full" style="margin-top:6px">Cancel</button>
             </div>
+
+            <details class="fold" style="margin-top:14px">
+              <summary>Recording setup — cover scale &amp; method</summary>
+              <div class="fold-body">
+                <label class="field-label" for="coverScaleSelect">Cover-abundance scale <span class="info-dot" role="button" tabindex="0" data-info="coverScale" aria-label="About cover-abundance scales">i</span></label>
+                <select id="coverScaleSelect" class="input">
+                  <option value="bb">Braun-Blanquet (r + 1 2 3 4 5)</option>
+                  <option value="bb-ext">Braun-Blanquet extended (r + 1 2m 2a 2b 3 4 5)</option>
+                  <option value="pct">Percentage cover</option>
+                </select>
+
+                <div class="field-label" style="margin-top:10px">Cover assessment method <span class="tag">tap ⓘ for details</span></div>
+                <div id="methodPicker" class="method-grid"></div>
+              </div>
+            </details>
           </div>
         </details>
 
         <details class="fold" id="releveNestedFold">
-          <summary>Nested sampling <span class="tag">optional</span></summary>
+          <summary>Nested sampling <span class="tag">optional</span> <span class="info-dot" role="button" tabindex="0" data-info="nested" aria-label="About nested sampling">i</span></summary>
           <div class="fold-body">
             <p class="hint">Record each species by the smallest sub-plot area it first appears in, to build a species-area curve. Off by default — the species list above works the same either way.</p>
             <label class="check"><input type="checkbox" id="nestedEnableBox"><span>Enable nested sub-plot sampling</span></label>
@@ -210,6 +216,7 @@
             <button type="button" id="releveGpsBtn" class="btn full">
               <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Capture GPS location (averaged)
+              <span class="info-dot" role="button" tabindex="0" data-info="gps" aria-label="About GPS averaging">i</span>
             </button>
             <div id="releveGpsStatus" class="hint"></div>
             <div class="settings-grid">
@@ -376,13 +383,16 @@
             <button type="button" id="transectVoiceLogBtn" class="btn full voice-log-btn" hidden>
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Start voice logging
+              <span class="info-dot" role="button" tabindex="0" data-info="voiceModes" aria-label="About voice logging">i</span>
             </button>
             <div id="transectVoiceLogStatus" class="hint"></div>
 
-            <button type="button" id="transectReviewBtn" class="btn full" style="margin-top:8px">Review &amp; approve</button>
+            <button type="button" id="transectReviewBtn" class="btn full" style="margin-top:8px"><span id="transectReviewLabel">Review &amp; approve</span>
+              <span class="info-dot" role="button" tabindex="0" data-info="transectReview" aria-label="About review &amp; approve">i</span>
+            </button>
 
             <div class="ac-wrap" style="margin-top:12px">
-              <label class="field-label" for="transectSearchInput">Add species manually</label>
+              <label class="field-label" for="transectSearchInput">Add species manually <span class="info-dot" role="button" tabindex="0" data-info="speciesSearch" aria-label="About species search">i</span></label>
               <input id="transectSearchInput" class="input" autocomplete="off" placeholder="Type to search — e.g. dro rot for Drosera rotundifolia">
               <div id="transectAcMenu" class="ac-menu"></div>
             </div>
@@ -417,6 +427,7 @@
             <button type="button" id="transectGpsBtn" class="btn full">
               <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Capture GPS location (averaged)
+              <span class="info-dot" role="button" tabindex="0" data-info="gps" aria-label="About GPS averaging">i</span>
             </button>
             <div id="transectGpsStatus" class="hint"></div>
             <div class="settings-grid">
@@ -519,6 +530,7 @@
             <button type="button" id="edggNwGpsBtn" class="btn full">
               <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Capture GPS location (averaged)
+              <span class="info-dot" role="button" tabindex="0" data-info="gps" aria-label="About GPS averaging">i</span>
             </button>
             <div id="edggNwGpsStatus" class="hint"></div>
             <div class="settings-grid">
@@ -538,6 +550,7 @@
             <button type="button" id="edggSeGpsBtn" class="btn full">
               <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
               Capture GPS location (averaged)
+              <span class="info-dot" role="button" tabindex="0" data-info="gps" aria-label="About GPS averaging">i</span>
             </button>
             <div id="edggSeGpsStatus" class="hint"></div>
             <div class="settings-grid">
@@ -933,7 +946,13 @@
         <h4>AI-enhanced voice matching <span class="tag">experimental</span></h4>
         <label class="check"><input type="checkbox" id="aiVoiceEnabled"><span>Use on-device Whisper for species dictation</span></label>
         <p class="hint" style="margin:0">Instead of trusting a generic dictation engine's guess at what you said, this records your voice, runs it through an on-device speech model, and directly scores the <strong>audio</strong> against every plausible species name in the checklist — picking whichever name the recording actually sounds most like, rather than matching text after the fact. Meant to noticeably outperform standard dictation on Latin names it was never trained on.</p>
-        <p class="hint" style="margin:6px 0 0"><strong>Tradeoffs:</strong> the model (~40&nbsp;MB) downloads once over a connection the first time you turn this on, then is cached by the browser and works offline after that. Recognition runs on your device's CPU, so each species takes a few seconds and uses more battery than standard dictation — including in "Start voice logging" while walking a relevé or transect, which also switches to this engine when enabled. Two names said back-to-back with too short a pause between them may be missed (no equivalent yet of the text-based multi-species splitting standard dictation uses).</p>
+        <p class="hint" style="margin:6px 0 0"><strong>Tradeoffs:</strong> the model downloads once over a connection the first time you turn this on, then is cached by the browser and works offline after that. Recognition runs on your device's CPU, so each species takes a few seconds and uses more battery than standard dictation — including in "Start voice logging" while walking a relevé or transect, which also switches to this engine when enabled. Two names said back-to-back with too short a pause between them may be missed (no equivalent yet of the text-based multi-species splitting standard dictation uses).</p>
+        <label class="field-label" for="aiVoiceQuality" style="margin-top:12px">Model size</label>
+        <select id="aiVoiceQuality" class="input">
+          <option value="accurate">Most accurate — base model (~77 MB, slower)</option>
+          <option value="fast">Faster — tiny model (~40 MB, less accurate)</option>
+        </select>
+        <p class="hint" style="margin:4px 0 0">The larger model is markedly better at the unusual Latin names this app depends on. Changing this takes effect on the next app reload.</p>
         <div id="aiVoiceStatus" class="hint" style="margin-top:8px"></div>
         <button type="button" id="aiVoiceDownloadBtn" class="btn full" style="margin-top:6px" hidden>Download model now</button>
 
@@ -979,7 +998,7 @@
     </button>
   </nav>
 
-  <script src="app.js?v=22"></script>
+  <script src="app.js?v=24"></script>
   <script>
     (() => {
       const root = document.documentElement;

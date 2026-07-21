@@ -120,7 +120,7 @@ const Store = {
   deletePhoto: id => idbDelete("photos", id),
   allPhotos: () => idbAll("photos"),
   getSettings: () => idbGet("settings", "app").then(s =>
-    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30 }, s || {})),
+    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30, aiVoiceEnabled: false }, s || {})),
   saveSettings: s => { s.key = "app"; return idbPut("settings", s); },
   wipeAll: () => Promise.all([idbClear("records"), idbClear("photos"), idbClear("settings")]),
 };
@@ -225,11 +225,14 @@ function coverInputHtml(scaleKey, currentValue) {
 /* ---------------------------------------------------------- */
 
 const viewStack = ["home"];
-const viewLeaveHooks = {}; // viewName -> fn; set by wireVoiceLogging to stop a stray mic session on navigation
+const viewLeaveHooks = {}; // viewName -> fn[]; run when navigating away (stop a stray mic session, cancel an in-flight GPS capture, …)
+function addLeaveHook(viewName, fn) {
+  (viewLeaveHooks[viewName] || (viewLeaveHooks[viewName] = [])).push(fn);
+}
 
 function showView(name) {
-  for (const [viewName, hook] of Object.entries(viewLeaveHooks)) {
-    if (viewName !== name && $("#view-" + viewName)?.classList.contains("active")) hook();
+  for (const [viewName, hooks] of Object.entries(viewLeaveHooks)) {
+    if (viewName !== name && $("#view-" + viewName)?.classList.contains("active")) hooks.forEach(h => h());
   }
   $all(".view").forEach(v => v.classList.remove("active"));
   const el = $("#view-" + name);
@@ -259,19 +262,25 @@ function wireAutocomplete(inputEl, menuEl, onPick) {
   let hiIndex = -1;
   let currentResults = [];
 
+  function freeTextRowHtml(q) {
+    if (!q) return "";
+    return `<div class="ac-item ac-freetext" data-freetext="1"><div class="sp-name">Add "${esc(q)}" as typed</div><div class="fam">Not in checklist</div></div>`;
+  }
+
   function render(results) {
     currentResults = results;
     hiIndex = -1;
+    const q = inputEl.value.trim();
     if (!results.length) {
-      menuEl.innerHTML = inputEl.value.trim() ? `<div class="ac-empty">No match — check spelling or try fewer letters</div>` : "";
-      menuEl.classList.toggle("show", !!inputEl.value.trim());
+      menuEl.innerHTML = q ? `<div class="ac-empty">No match — check spelling or try fewer letters</div>${freeTextRowHtml(q)}` : "";
+      menuEl.classList.toggle("show", !!q);
       return;
     }
     menuEl.innerHTML = results.map((sp, i) => `
       <div class="ac-item" data-i="${i}">
         <div class="sp-name" style="font-style:italic">${esc(sp.t)}</div>
         <div class="fam">${esc(sp.f || "")} ${sp.n ? `<span class="native-tag">· ${esc(sp.n.replace(/^CH_/, "").replace(/_/g, " ").toLowerCase())}</span>` : ""}</div>
-      </div>`).join("");
+      </div>`).join("") + freeTextRowHtml(q);
     menuEl.classList.add("show");
   }
 
@@ -284,13 +293,14 @@ function wireAutocomplete(inputEl, menuEl, onPick) {
     if (inputEl.value.trim()) render(Species.search(inputEl.value, 25));
   });
   inputEl.addEventListener("keydown", e => {
-    if (!menuEl.classList.contains("show") || !currentResults.length) return;
-    if (e.key === "ArrowDown") { e.preventDefault(); hiIndex = Math.min(hiIndex + 1, currentResults.length - 1); highlight(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); hiIndex = Math.max(hiIndex - 1, 0); highlight(); }
+    if (!menuEl.classList.contains("show")) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); if (currentResults.length) { hiIndex = Math.min(hiIndex + 1, currentResults.length - 1); highlight(); } }
+    else if (e.key === "ArrowUp") { e.preventDefault(); if (currentResults.length) { hiIndex = Math.max(hiIndex - 1, 0); highlight(); } }
     else if (e.key === "Enter") {
       e.preventDefault();
       const pick = currentResults[hiIndex >= 0 ? hiIndex : 0];
       if (pick) choose(pick);
+      else if (inputEl.value.trim()) choose({ t: inputEl.value.trim(), f: "", freeText: true });
     } else if (e.key === "Escape") { menuEl.classList.remove("show"); }
   });
   function highlight() {
@@ -300,6 +310,7 @@ function wireAutocomplete(inputEl, menuEl, onPick) {
     const item = e.target.closest(".ac-item");
     if (!item) return;
     e.preventDefault();
+    if (item.dataset.freetext) { choose({ t: inputEl.value.trim(), f: "", freeText: true }); return; }
     choose(currentResults[Number(item.dataset.i)]);
   });
   function choose(sp) {
@@ -383,6 +394,10 @@ function averagedGpsCapture(opts) {
       lonEl.value = avgLon.toFixed(6);
       if (altEl && alts.length) altEl.value = Math.round(alts.reduce((a, b) => a + b, 0) / alts.length);
       if (accEl) accEl.value = avgAcc.toFixed(1);
+      // .value assignment doesn't fire input events on its own — dispatch
+      // so anything listening (e.g. the location map) picks up the change.
+      latEl.dispatchEvent(new Event("input"));
+      lonEl.dispatchEvent(new Event("input"));
       statusEl.textContent = n >= targetCount
         ? `Averaged ${n} fixes ≤${threshold} m — mean accuracy ±${avgAcc.toFixed(1)} m`
         : `Stopped early with ${n}/${targetCount} fixes ≤${threshold} m — mean accuracy ±${avgAcc.toFixed(1)} m`;
@@ -419,22 +434,107 @@ function averagedGpsCapture(opts) {
   return { cancel: () => { statusEl.textContent = "Location capture cancelled."; if (watchId != null) navigator.geolocation.clearWatch(watchId); if (timeoutId) clearTimeout(timeoutId); done = true; opts.onDone && opts.onDone(); } };
 }
 
-function wireGpsButton(btn, statusEl, latEl, lonEl, altEl, accEl) {
+function wireGpsButton(btn, statusEl, latEl, lonEl, altEl, accEl, viewName) {
   let active = null;
-  btn.addEventListener("click", async () => {
-    if (active) { active.cancel(); active = null; setBtnState(false); return; }
+  let onDoneExtra = null;
+
+  async function start() {
+    if (active) return;
     const settings = await Store.getSettings();
     const threshold = Number(settings.gpsThreshold) || 10;
     setBtnState(true);
     active = averagedGpsCapture({
       statusEl, latEl, lonEl, altEl, accEl, threshold, targetCount: GPS_TARGET_COUNT,
-      onDone: () => { active = null; setBtnState(false); },
+      onDone: () => { active = null; setBtnState(false); const extra = onDoneExtra; onDoneExtra = null; if (extra) extra(); },
     });
-  });
+  }
+  function cancel() {
+    if (active) { active.cancel(); active = null; setBtnState(false); }
+  }
+
+  btn.addEventListener("click", () => { if (active) cancel(); else start(); });
   function setBtnState(capturing) {
     btn.lastChild.textContent = capturing ? " Cancel locating…" : " Capture GPS location (averaged)";
     btn.classList.toggle("btn-danger", capturing);
   }
+  if (viewName) addLeaveHook(viewName, cancel);
+
+  // `onDone` fires once after the next capture completes/cancels — used to
+  // auto-collapse the location fold only for the initial auto-capture on a
+  // new record, not for later manual recaptures mid-edit.
+  return { start: onDone => { onDoneExtra = onDone || null; start(); }, cancel };
+}
+
+/* ---------------------------------------------------------- */
+/* location map — Swisstopo (topo + aerial) and OpenStreetMap  */
+/* (global) as switchable layers, via Leaflet (vendored, no    */
+/* CDN). Tile images still need a connection; the app degrades */
+/* gracefully — the wrap just stays hidden without one.        */
+/* ---------------------------------------------------------- */
+
+function swissTileLayers() {
+  return {
+    "Swisstopo — topo": L.tileLayer(
+      "https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-farbe/default/current/3857/{z}/{x}/{y}.jpeg",
+      { maxNativeZoom: 18, maxZoom: 20, attribution: "© swisstopo" }
+    ),
+    "Swisstopo — aerial": L.tileLayer(
+      "https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.swissimage/default/current/3857/{z}/{x}/{y}.jpeg",
+      { maxNativeZoom: 19, maxZoom: 20, attribution: "© swisstopo" }
+    ),
+    "OpenStreetMap (global)": L.tileLayer(
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: "© OpenStreetMap contributors" }
+    ),
+  };
+}
+
+/* One map instance per editor, created lazily and reused across
+   record switches within that editor (Leaflet can't be re-init'd
+   on the same container). `update` shows/hides the wrap and moves
+   the marker; `invalidate` fixes Leaflet's sizing when the map's
+   container becomes visible after being hidden (e.g. a <details>
+   fold opening). */
+function createLocationMap(containerId, wrapId) {
+  let map = null, marker = null, accCircle = null, accLabelEl = null;
+
+  function ensureMap(lat, lon) {
+    if (map) return;
+    const layers = swissTileLayers();
+    map = L.map(containerId, { attributionControl: true, layers: [layers["Swisstopo — topo"]] });
+    L.control.layers(layers, null, { collapsed: false }).addTo(map);
+    accCircle = L.circle([lat, lon], { radius: 0, color: "#2f6b47", weight: 1, fillColor: "#2f6b47", fillOpacity: 0, opacity: 0, interactive: false }).addTo(map);
+    marker = L.circleMarker([lat, lon], { radius: 8, color: "#2f6b47", weight: 2, fillColor: "#4fa971", fillOpacity: 0.9 }).addTo(map);
+    const accCtl = L.control({ position: "bottomleft" });
+    accCtl.onAdd = () => { accLabelEl = L.DomUtil.create("div", "map-acc-label"); return accLabelEl; };
+    accCtl.addTo(map);
+    map.setView([lat, lon], 15);
+  }
+
+  return {
+    // accStr: GPS accuracy in meters, drawn as an uncertainty circle
+    // around the marker — "the point" is never more precise than this.
+    update(latStr, lonStr, accStr) {
+      const wrap = document.getElementById(wrapId);
+      const lat = Number(latStr), lon = Number(lonStr);
+      const acc = Number(accStr);
+      const hasCoords = latStr !== "" && lonStr !== "" && !isNaN(lat) && !isNaN(lon);
+      if (!wrap) return;
+      wrap.hidden = !hasCoords;
+      if (!hasCoords) return;
+      if (!map) ensureMap(lat, lon);
+      else { marker.setLatLng([lat, lon]); map.setView([lat, lon], map.getZoom()); }
+      const hasAcc = !isNaN(acc) && acc > 0;
+      if (accCircle) {
+        accCircle.setLatLng([lat, lon]);
+        accCircle.setRadius(hasAcc ? acc : 0);
+        accCircle.setStyle({ opacity: hasAcc ? 1 : 0, fillOpacity: hasAcc ? 0.12 : 0 });
+      }
+      if (accLabelEl) accLabelEl.textContent = hasAcc ? `±${Math.round(acc)} m` : "";
+      setTimeout(() => map && map.invalidateSize(), 60);
+    },
+    invalidate() { if (map) setTimeout(() => map.invalidateSize(), 60); },
+  };
 }
 
 /* ---------------------------------------------------------- */
@@ -708,6 +808,43 @@ const VOICE_HIGH_CONF = 0.72;
 const VOICE_LOW_CONF = 0.40;
 const VOICE_MAX_RETRIES = 3;
 
+// Records via WhisperVoice, transcribes, narrows candidates with the same
+// text fuzzy-matcher used for Web Speech results, then rescores that
+// shortlist directly against the recorded audio. Auto-fills the top match
+// and always also shows it (plus runners-up) as a tap-to-pick list, since
+// these are raw log-likelihoods rather than the 0–1 confidence scale the
+// Web Speech path calibrates its auto-fill threshold against.
+async function runAiDictation(inputEl, menuEl, setStatus, onPick) {
+  setStatus("Transcribing…");
+  try {
+    const blob = await AiVoice._pendingRecording;
+    AiVoice._pendingRecording = null;
+    const pcm = await AiVoice.mod.blobToPCM16k(blob);
+    const { transcript, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
+    if (!transcript || transcript.length < 2) { setStatus("Didn't catch that — type it instead."); return; }
+    const shortlist = fuzzyMatchTranscripts([transcript], 40);
+    if (!shortlist.length) {
+      inputEl.value = transcript;
+      inputEl.dispatchEvent(new Event("input"));
+      inputEl.focus();
+      setStatus(`Heard "${transcript}" — not in the checklist, typed as-is`);
+      return;
+    }
+    const textToSp = new Map(shortlist.map(m => [m.sp.t, m.sp]));
+    const ranked = await AiVoice.mod.rescoreCandidates(encoderHandle, [...textToSp.keys()]);
+    const top = textToSp.get(ranked[0].text);
+    inputEl.value = top.t;
+    inputEl.dispatchEvent(new Event("input"));
+    inputEl.focus();
+    setStatus(`Heard "${transcript}" → ${top.t}`);
+    const menuMatches = ranked.slice(0, 5).map(r => ({ sp: textToSp.get(r.text), score: r.score }));
+    renderVoiceCandidates(menuEl, menuMatches, sp => { onPick(sp); setStatus(""); });
+  } catch (e) {
+    console.error(e);
+    setStatus("AI voice matching failed: " + (e.message || e));
+  }
+}
+
 function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return;
@@ -719,11 +856,31 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
   let listening = false;
   let retries = 0;
   let manualStop = false;
+  let aiRecording = false;
 
   function setStatus(text) { if (statusEl) statusEl.textContent = text || ""; }
   function startListening() { try { rec.start(); } catch (e) { /* already running */ } }
 
-  btn.addEventListener("click", () => {
+  btn.addEventListener("click", async () => {
+    const settings = await Store.getSettings();
+    if (settings.aiVoiceEnabled && AiVoice.mod && AiVoice.mod.isLoaded()) {
+      if (aiRecording) {
+        aiRecording = false;
+        btn.classList.remove("listening");
+        AiVoice.mod.stopRecording();
+        await runAiDictation(inputEl, menuEl, setStatus, onPick);
+      } else {
+        try {
+          AiVoice._pendingRecording = AiVoice.mod.startRecording();
+          aiRecording = true;
+          btn.classList.add("listening");
+          setStatus("Recording — tap again when done…");
+        } catch (e) {
+          setStatus("Microphone access failed: " + (e.message || e));
+        }
+      }
+      return;
+    }
     if (listening) { manualStop = true; rec.stop(); setStatus(""); return; }
     retries = 0;
     manualStop = false;
@@ -781,6 +938,69 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
 /* each recognized name is matched and added automatically     */
 /* ---------------------------------------------------------- */
 
+// AI-mode candidate scores are log-likelihood margins (unbounded, ≥0), not
+// the Web Speech path's native 0–1 confidence — squashed here into the same
+// 0–1 range addSpecies()/the certainty-pill UI expect, calibrated so a clear
+// audio winner lands above VOICE_HIGH_CONF and a close call sits below it.
+function aiConfidenceFromMargin(margin) {
+  if (margin == null) return 0.9; // no runner-up to be uncertain against
+  return 0.5 + 0.48 * (1 - Math.exp(-Math.max(0, margin) * 1.5));
+}
+
+// Handles one VAD-captured utterance in AI voice-logging mode: transcribe,
+// shortlist via the text fuzzy-matcher, rescore that shortlist against the
+// audio, then feed the winner through the same addSpecies()/checkpoint/
+// spoken-feedback contract the Web Speech path below uses — so both paths
+// look identical from the editor's point of view.
+async function handleAiVoiceSegment(blob, addSpecies, setStatus, speakFeedback) {
+  try {
+    const pcm = await AiVoice.mod.blobToPCM16k(blob);
+    const { transcript, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
+    const heard = (transcript || "").trim();
+    if (heard.length < 3) return; // breath/noise while walking — not worth interrupting for
+
+    // Kept shorter than the single-field dictation path's shortlist (40) —
+    // each candidate here costs its own decoder forward pass (~1s), and
+    // this runs mid-walk where latency matters more than squeezing out a
+    // little extra shortlist coverage; the text pre-filter already ranks
+    // genuinely close matches near the top.
+    const shortlist = fuzzyMatchTranscripts([heard], 15);
+    if (!shortlist.length) {
+      const sp = { t: heard.charAt(0).toUpperCase() + heard.slice(1), f: "", freeText: true };
+      const result = await addSpecies(sp, { unconfirmed: true, silent: true });
+      if (result && result.added !== false) {
+        setStatus(`Added as typed (not in checklist): ${sp.t} — please review`);
+        if (speakFeedback) speak(`Added ${sp.t}. Not in the checklist, please review.`);
+        if (result.checkpoint) {
+          toast(`${result.checkpoint} taxa logged — review when ready`);
+          if (speakFeedback) speak(`${result.checkpoint} species logged. Review when you're ready.`);
+        }
+      } else {
+        setStatus(`Already logged: ${sp.t}`);
+      }
+      return;
+    }
+
+    const textToSp = new Map(shortlist.map(m => [m.sp.t, m.sp]));
+    const ranked = await AiVoice.mod.rescoreCandidates(encoderHandle, [...textToSp.keys()]);
+    const certainty = aiConfidenceFromMargin(ranked[1] ? ranked[0].score - ranked[1].score : null);
+    const confident = certainty >= VOICE_HIGH_CONF;
+    const sp = textToSp.get(ranked[0].text);
+
+    const result = await addSpecies(sp, { unconfirmed: !confident, score: certainty, silent: true });
+    if (!result || result.added === false) { setStatus(`Already logged: ${sp.t}`); return; }
+    setStatus(`Heard "${heard}" → ${sp.t}${confident ? "" : " (please confirm)"}`);
+    if (speakFeedback) speak(confident ? sp.t : `${sp.t}, please confirm`);
+    if (result.checkpoint) {
+      toast(`${result.checkpoint} taxa logged — review when ready`);
+      if (speakFeedback) speak(`${result.checkpoint} species logged. Review when you're ready.`);
+    }
+  } catch (e) {
+    console.error(e);
+    setStatus("AI voice matching error: " + (e.message || e));
+  }
+}
+
 function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return;
@@ -799,8 +1019,23 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
 
   let active = false;    // user has toggled logging on
   let running = false;   // a recognition session is currently alive
-  let unclearStreak = 0;
   let speakFeedback = true;
+
+  // AI mode: VAD-segmented continuous capture instead of the Web Speech API.
+  // Segments can arrive faster than one finishes processing (they keep
+  // being captured while a previous one is still transcribing/rescoring),
+  // so they're queued and drained one at a time — the underlying ONNX
+  // Runtime sessions aren't safe to call concurrently with themselves.
+  let aiMode = false;
+  let aiStop = null;
+  const aiQueue = [];
+  let aiDraining = false;
+  async function drainAiQueue() {
+    if (aiDraining) return;
+    aiDraining = true;
+    while (aiQueue.length) await handleAiVoiceSegment(aiQueue.shift(), addSpecies, setStatus, speakFeedback);
+    aiDraining = false;
+  }
 
   function setStatus(t) { if (statusEl) statusEl.textContent = t || ""; }
   function setBtnState() {
@@ -817,17 +1052,35 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
     active = false;
     setBtnState();
     setStatus("Voice logging stopped.");
+    if (aiMode) {
+      aiMode = false;
+      if (aiStop) { aiStop(); aiStop = null; }
+      aiQueue.length = 0;
+      return;
+    }
     try { rec.stop(); } catch (e) { /* not running */ }
   }
-  viewLeaveHooks[viewName] = stopLogging;
+  addLeaveHook(viewName, stopLogging);
 
   btn.addEventListener("click", async () => {
     if (active) { stopLogging(); return; }
-    active = true;
-    setBtnState();
     const settings = await Store.getSettings();
     speakFeedback = settings.voiceSpeakFeedback !== false;
-    unclearStreak = 0;
+    if (settings.aiVoiceEnabled && AiVoice.mod && AiVoice.mod.isLoaded()) {
+      try {
+        aiStop = await AiVoice.mod.startContinuousCapture(blob => { aiQueue.push(blob); drainAiQueue(); });
+      } catch (e) {
+        setStatus("Microphone access failed: " + (e.message || e));
+        return;
+      }
+      active = true;
+      aiMode = true;
+      setBtnState();
+      setStatus("Listening (AI) — say each species as you spot it…");
+      return;
+    }
+    active = true;
+    setBtnState();
     setStatus("Listening — say each species as you spot it…");
     startSession();
   });
@@ -866,14 +1119,27 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
     const usable = (segs || []).filter(seg => seg.score >= VOICE_LOW_CONF);
 
     if (!usable.length) {
-      unclearStreak++;
-      setStatus(`Didn't catch that ("${transcripts[0] || "…"}") — say the species again`);
-      if (unclearStreak <= 2 && speakFeedback) {
-        speak("Sorry, I didn't catch that. Please repeat the species name.");
+      const heard = (transcripts[0] || "").trim();
+      // A few characters is more likely a stray noise/breath than an
+      // attempted name — not worth recording or interrupting for.
+      if (heard.length < 4) return;
+      // Otherwise trust that a real (if unlisted) species was said —
+      // record it as typed rather than fighting the speaker; it's
+      // flagged for review same as any other low-confidence entry.
+      const sp = { t: heard.charAt(0).toUpperCase() + heard.slice(1), f: "", freeText: true };
+      const result = await addSpecies(sp, { unconfirmed: true, silent: true });
+      if (result && result.added !== false) {
+        setStatus(`Added as typed (not in checklist): ${sp.t} — please review`);
+        if (speakFeedback) speak(`Added ${sp.t}. Not in the checklist, please review.`);
+        if (result.checkpoint) {
+          toast(`${result.checkpoint} taxa logged — review when ready`);
+          if (speakFeedback) speak(`${result.checkpoint} species logged. Review when you're ready.`);
+        }
+      } else {
+        setStatus(`Already logged: ${sp.t}`);
       }
       return;
     }
-    unclearStreak = 0;
 
     const addedNames = [], unsureNames = [];
     let lastCheckpoint = null;
@@ -903,6 +1169,235 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
 }
 
 /* ============================================================
+   INFO MODAL (generic — used by the cover-method picker)
+   ============================================================ */
+
+function openInfoModal(title, html) {
+  $("#infoModalTitle").textContent = title;
+  $("#infoModalBody").innerHTML = html;
+  $("#infoModal").hidden = false;
+}
+function closeInfoModal() { $("#infoModal").hidden = true; }
+function wireInfoModal() {
+  $("#infoModalClose").addEventListener("click", closeInfoModal);
+  $("#infoModal").addEventListener("click", e => { if (e.target.id === "infoModal") closeInfoModal(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#infoModal").hidden) closeInfoModal(); });
+}
+
+/* ============================================================
+   COVER-ASSESSMENT METHODS
+   Field-practical subset of Peratoner & Pötsch (2015), "Erhebungsmethoden
+   des Pflanzenbestandes im Grünland", 20. Alpenländisches Expertenforum,
+   Table 2. Stats legend: - none, + low, ++ medium, +++ high, ++++ very high.
+   ============================================================ */
+
+const COVER_METHOD_DIAGRAMS = {
+  visual: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:120px;display:block;margin:0 auto">
+    <path d="M50 18 Q70 4 90 18 Q70 32 50 18 Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+    <circle cx="70" cy="18" r="4.5" fill="currentColor"/>
+    <line x1="70" y1="24" x2="70" y2="40" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 3" opacity="0.6"/>
+    <rect x="20" y="44" width="100" height="42" fill="none" stroke="currentColor" stroke-width="1.8"/>
+    <path d="M28 68 Q34 56 46 60 Q56 64 50 74 Q40 80 28 76 Z" fill="currentColor" opacity="0.35"/>
+    <path d="M65 80 Q70 64 84 66 Q96 68 92 80 Q80 86 65 80 Z" fill="currentColor" opacity="0.35"/>
+    <path d="M96 52 Q104 48 110 54 Q108 62 100 60 Z" fill="currentColor" opacity="0.35"/>
+  </svg>`,
+  frame: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:120px;display:block;margin:0 auto">
+    <rect x="24" y="10" width="92" height="72" fill="none" stroke="currentColor" stroke-width="2"/>
+    <line x1="47" y1="10" x2="47" y2="82" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <line x1="70" y1="10" x2="70" y2="82" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <line x1="93" y1="10" x2="93" y2="82" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <line x1="24" y1="28" x2="116" y2="28" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <line x1="24" y1="46" x2="116" y2="46" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <line x1="24" y1="64" x2="116" y2="64" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+    <rect x="24" y="10" width="23" height="18" fill="currentColor" opacity="0.25"/>
+    <rect x="70" y="28" width="23" height="18" fill="currentColor" opacity="0.25"/>
+    <rect x="93" y="46" width="23" height="18" fill="currentColor" opacity="0.25"/>
+    <rect x="47" y="64" width="23" height="18" fill="currentColor" opacity="0.25"/>
+  </svg>`,
+  point: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:120px;display:block;margin:0 auto">
+    <line x1="20" y1="14" x2="20" y2="78" stroke="currentColor" stroke-width="2"/>
+    <line x1="120" y1="14" x2="120" y2="78" stroke="currentColor" stroke-width="2"/>
+    <line x1="20" y1="14" x2="120" y2="14" stroke="currentColor" stroke-width="2"/>
+    <line x1="10" y1="78" x2="130" y2="78" stroke="currentColor" stroke-width="1.6"/>
+    <line x1="30" y1="14" x2="30" y2="72" stroke="currentColor" stroke-width="1.2"/><circle cx="30" cy="72" r="2.2" fill="currentColor"/>
+    <line x1="55" y1="14" x2="55" y2="64" stroke="currentColor" stroke-width="1.2"/><circle cx="55" cy="64" r="2.2" fill="currentColor"/>
+    <line x1="80" y1="14" x2="80" y2="72" stroke="currentColor" stroke-width="1.2"/><circle cx="80" cy="72" r="2.2" fill="currentColor"/>
+    <line x1="105" y1="14" x2="105" y2="66" stroke="currentColor" stroke-width="1.2"/><circle cx="105" cy="66" r="2.2" fill="currentColor"/>
+  </svg>`,
+  daget: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:120px;display:block;margin:0 auto">
+    <line x1="12" y1="66" x2="128" y2="66" stroke="currentColor" stroke-width="1.6" stroke-dasharray="1 4"/>
+    <line x1="20" y1="40" x2="20" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="20" cy="66" r="2" fill="currentColor"/>
+    <line x1="40" y1="48" x2="40" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="40" cy="66" r="2" fill="currentColor"/>
+    <line x1="60" y1="40" x2="60" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="60" cy="66" r="2" fill="currentColor"/>
+    <line x1="80" y1="48" x2="80" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="80" cy="66" r="2" fill="currentColor"/>
+    <line x1="100" y1="40" x2="100" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="100" cy="66" r="2" fill="currentColor"/>
+    <line x1="120" y1="48" x2="120" y2="66" stroke="currentColor" stroke-width="1.4"/><circle cx="120" cy="66" r="2" fill="currentColor"/>
+    <line x1="12" y1="72" x2="128" y2="72" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+  </svg>`,
+};
+
+const COVER_METHODS = [
+  {
+    id: "visual", label: "Visual estimation",
+    info: `<p>Estimate each species' percentage cover (or yield share) directly by eye, without equipment. The fastest method and the only one needing no gear at all — but the most subjective, and accuracy depends heavily on the observer's training and experience.</p>
+      <p>Works best on small plots with compact, clearly distinguishable patches; harder on layered, grass-dominated stands. Flowering plants tend to get overestimated. Best practice: judge the weakest (rarest) species first — they're easier to estimate precisely — and always assess from within the plot, not from its edge.</p>
+      <table class="method-stats">
+        <tr><th>Captures</th><td>Cover, yield share</td></tr>
+        <tr><th>Accuracy / repeatability</th><td>Low* <span class="hint">(*strongly observer-dependent; can be good for the same experienced observer over time)</span></td></tr>
+        <tr><th>Subjectivity</th><td>Very high</td></tr>
+        <tr><th>Time needed</th><td>Low <span class="hint">(even lower with an interval-based scale)</span></td></tr>
+        <tr><th>Equipment</th><td>None</td></tr>
+        <tr><th>Weather-sensitive</th><td>Low</td></tr>
+      </table>`,
+  },
+  {
+    id: "frame", label: "Frame method (count / frequency)",
+    info: `<p>A frame of known area — often subdivided into a grid of subcells — is laid on the plot. Used two ways: as a <strong>count frame</strong>, tallying individuals inside it for plant density; or as a <strong>frequency frame</strong>, recording presence/absence of each species per subcell to get its frequency (% of subcells occupied).</p>
+      <p>A rooting-inside-the-frame rule is needed for plants straddling the edge. Smaller frames give a larger edge-to-area ratio and more of these borderline calls, so 0.5×0.5 m or 1×1 m frames are typical in grassland work.</p>
+      <table class="method-stats">
+        <tr><th>Captures</th><td>Density (count frame) or frequency (frequency frame)</td></tr>
+        <tr><th>Accuracy / repeatability</th><td>Medium–high</td></tr>
+        <tr><th>Subjectivity</th><td>Low</td></tr>
+        <tr><th>Time needed</th><td>Low–medium</td></tr>
+        <tr><th>Equipment</th><td>Low <span class="hint">(a frame, ideally gridded)</span></td></tr>
+        <tr><th>Weather-sensitive</th><td>Low</td></tr>
+      </table>`,
+  },
+  {
+    id: "point", label: "Point-quadrat frame",
+    info: `<p>Also called point-intercept or pin-frame method. A rack lowers thin pins or wires vertically at fixed points; whichever species each pin touches is recorded. If only the first (topmost) contact per pin counts, the result is projective cover; if every contact along the pin is recorded, the result also approximates relative biomass.</p>
+      <p>Good objectivity and precision for tracking vegetation change over time, but slow, and hard or impossible to use in wind or in tall, dense stands. Rare species usually need many pins to be caught reliably.</p>
+      <table class="method-stats">
+        <tr><th>Captures</th><td>Cover, yield share, frequency</td></tr>
+        <tr><th>Accuracy / repeatability</th><td>Medium</td></tr>
+        <tr><th>Subjectivity</th><td>Low</td></tr>
+        <tr><th>Time needed</th><td>High</td></tr>
+        <tr><th>Equipment</th><td>Medium <span class="hint">(pin frame or rack)</span></td></tr>
+        <tr><th>Weather-sensitive</th><td>Medium <span class="hint">(wind moves the pins)</span></td></tr>
+      </table>`,
+  },
+  {
+    id: "daget", label: "Daget–Poissonet line analysis",
+    info: `<p>A line-transect variant of the point-quadrat method, common in French and Italian pasture surveys (Daget &amp; Poissonet, 1971). A tape is stretched across the plot and a bayonet or thin metal rod is lowered into the ground at regular intervals along it; the species touched at each point is recorded.</p>
+      <p>Simpler to carry and set up than a full pin frame, and works well along a walked transect. Like the point-quadrat method it needs still air and moderate vegetation height to work reliably.</p>
+      <table class="method-stats">
+        <tr><th>Captures</th><td>Yield share, frequency</td></tr>
+        <tr><th>Accuracy / repeatability</th><td>Medium</td></tr>
+        <tr><th>Subjectivity</th><td>Low</td></tr>
+        <tr><th>Time needed</th><td>High</td></tr>
+        <tr><th>Equipment</th><td>Low <span class="hint">(tape + bayonet/rod)</span></td></tr>
+        <tr><th>Weather-sensitive</th><td>Low</td></tr>
+      </table>`,
+  },
+];
+
+function coverMethodInfoHtml(m) {
+  return m.info + `<p class="hint">Source: Peratoner, G. &amp; Pötsch, E.M. (2015): Erhebungsmethoden des Pflanzenbestandes im Grünland. 20. Alpenländisches Expertenforum, 15–22.</p>`;
+}
+
+function renderMethodPicker(hostId, selected, onPick) {
+  const host = $(hostId);
+  host.innerHTML = COVER_METHODS.map(m => `
+    <button type="button" class="method-card ${m.id === selected ? "selected" : ""}" data-method="${m.id}">
+      <span class="method-info-btn" data-info="${m.id}" title="More about this method" aria-label="More about this method">i</span>
+      ${COVER_METHOD_DIAGRAMS[m.id]}
+      <span class="method-label">${m.label}</span>
+    </button>`).join("");
+  $all(".method-card", host).forEach(card => {
+    card.addEventListener("click", e => {
+      if (e.target.closest(".method-info-btn")) return;
+      onPick(card.dataset.method);
+    });
+  });
+  $all(".method-info-btn", host).forEach(btn => {
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const m = COVER_METHODS.find(x => x.id === btn.dataset.info);
+      openInfoModal(m.label, coverMethodInfoHtml(m));
+    });
+  });
+}
+
+/* ============================================================
+   NESTED SAMPLING (species-area design)
+   Optional nested sub-plot mode for relevés: either concentric
+   ("centre-out") or anchored at two opposite plot corners
+   ("corner-based", as in the EDGG methodology — see the EDGG plot
+   editor for the full standardised protocol). The area progression
+   is configurable; EDGG's own progression is offered as one preset.
+   ============================================================ */
+
+const NEST_PROGRESSIONS = {
+  edgg: { label: "EDGG standard (Dengler et al.)", sizes: [0.0001, 0.001, 0.01, 0.1, 1, 3, 10, 30, 100] },
+  quarter: { label: "Classic nested quadrat (×4 area/step)", sizes: [0.01, 0.04, 0.16, 0.64, 2.56, 10.24, 40.96, 100] },
+};
+
+function areaEdgeLabel(areaM2) {
+  const a = Number(areaM2);
+  if (!isFinite(a) || a <= 0) return "";
+  const edge = Math.sqrt(a);
+  if (edge < 1) return `${Number((edge * 100).toFixed(1))} cm`;
+  return `${Number(edge.toFixed(2))} m`;
+}
+
+function parseCustomProgression(str) {
+  return (str || "")
+    .split(",")
+    .map(s => Number(s.trim()))
+    .filter(n => isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+}
+
+function activeProgression(r) {
+  if (r.progressionPreset === "custom") return parseCustomProgression(r.customProgression);
+  return (NEST_PROGRESSIONS[r.progressionPreset] || NEST_PROGRESSIONS.edgg).sizes;
+}
+
+function nestedDiagramSvg(nestingType, sizes) {
+  if (!sizes || !sizes.length) return `<p class="hint">Set an area progression above to see the plot diagram.</p>`;
+  const pxPerM = 24;
+  const maxSize = sizes[sizes.length - 1];
+  const outerEdge = Math.max(Math.sqrt(maxSize) * pxPerM, 20);
+  const pad = 44;
+  const size = outerEdge + pad * 2;
+
+  if (nestingType === "center") {
+    const cx = size / 2, cy = size / 2;
+    const rects = sizes.map((s, i) => {
+      const edge = Math.max(Math.sqrt(s) * pxPerM, 4);
+      const isOuter = i === sizes.length - 1;
+      return `<rect x="${cx - edge / 2}" y="${cy - edge / 2}" width="${edge}" height="${edge}" fill="${isOuter ? "none" : "currentColor"}" opacity="${isOuter ? 1 : 0.10 + i * 0.05}" stroke="currentColor" stroke-width="${isOuter ? 2 : 1}"/>`;
+    }).join("");
+    return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:300px;display:block;margin:0 auto">
+      ${rects}
+      <circle cx="${cx}" cy="${cy}" r="2.5" fill="currentColor"/>
+      <text x="${cx}" y="${pad - 12}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">${sizes.length} nested sizes, centre-out</text>
+      <text x="${cx}" y="${size - 10}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">${areaEdgeLabel(sizes[0])} → ${maxSize} m²</text>
+    </svg>`;
+  }
+
+  const nestSizes = sizes.slice(0, -1);
+  const x0 = pad, y0 = pad, x1 = pad + outerEdge, y1 = pad + outerEdge;
+  const nwRects = nestSizes.map((s, i) => {
+    const edge = Math.max(Math.sqrt(s) * pxPerM, 4);
+    return `<rect x="${x0}" y="${y0}" width="${edge}" height="${edge}" fill="currentColor" opacity="${0.10 + i * 0.06}"/>`;
+  }).join("");
+  const seRects = nestSizes.map((s, i) => {
+    const edge = Math.max(Math.sqrt(s) * pxPerM, 4);
+    return `<rect x="${x1 - edge}" y="${y1 - edge}" width="${edge}" height="${edge}" fill="currentColor" opacity="${0.10 + i * 0.06}"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:300px;display:block;margin:0 auto">
+    <rect x="${x0}" y="${y0}" width="${outerEdge}" height="${outerEdge}" fill="none" stroke="currentColor" stroke-width="2"/>
+    <line x1="${x0}" y1="${y1}" x2="${x1}" y2="${y0}" stroke="currentColor" stroke-width="1" stroke-dasharray="4 3" opacity="0.5"/>
+    ${nwRects}
+    <text x="${x0 + 2}" y="${y0 - 6}" font-size="10" font-weight="700" fill="currentColor">NW</text>
+    ${seRects}
+    <text x="${x1 - 24}" y="${y1 + 16}" font-size="10" font-weight="700" fill="currentColor">SE</text>
+    <text x="${(x0 + x1) / 2}" y="${y1 + 30}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">${nestSizes.length} nested size${nestSizes.length === 1 ? "" : "s"} per corner, ${maxSize} m² whole plot</text>
+  </svg>`;
+}
+
+/* ============================================================
    RELEVÉ EDITOR
    ============================================================ */
 
@@ -918,6 +1413,9 @@ const ReleveEditor = {
       area: "", slope: "", aspect: "", habitat: "",
       coverTree: "", coverShrub: "", coverHerb: "", coverMoss: "",
       coverScale: "bb",
+      assessmentMethod: "visual",
+      nestedEnabled: false, nestingType: "center", progressionPreset: "edgg", customProgression: "",
+      seLat: "", seLon: "", seAlt: "", seAcc: "",
       species: [], photoIds: [], notes: "",
     };
   },
@@ -928,6 +1426,11 @@ const ReleveEditor = {
     this.current.coverScale = settings.defaultScale || "bb";
     await this.render();
     pushView("releve");
+    // Fix the survey point immediately — the location fold auto-collapses
+    // once it's done, handing visual focus to the species list below.
+    const locFold = $("#releveLocationFold");
+    if (locFold) locFold.open = true;
+    this._gps.start(() => { if (locFold) locFold.open = false; });
   },
 
   async openExisting(id) {
@@ -958,8 +1461,37 @@ const ReleveEditor = {
     $("#coverScaleSelect").value = r.coverScale;
     $("#releveNotes").value = r.notes;
     $("#releveGpsStatus").textContent = "";
+    this._map = this._map || createLocationMap("releveMap", "releveMapWrap");
+    this._map.update(r.lat, r.lon, r.acc);
+    this.renderAssessmentMethod();
+    this.renderNested();
     this.renderSpecies();
     await renderPhotoGrid(r.photoIds, $("#relevePhotos"));
+  },
+
+  renderAssessmentMethod() {
+    renderMethodPicker("#methodPicker", this.current.assessmentMethod, m => {
+      this.current.assessmentMethod = m;
+      this.renderAssessmentMethod();
+    });
+  },
+
+  renderNested() {
+    const r = this.current;
+    $("#nestedEnableBox").checked = r.nestedEnabled;
+    $("#nestedOptions").hidden = !r.nestedEnabled;
+    $all('input[name="nestingType"]').forEach(el => { el.checked = el.value === r.nestingType; });
+    $all('input[name="progressionPreset"]').forEach(el => { el.checked = el.value === r.progressionPreset; });
+    $("#customProgressionInput").hidden = r.progressionPreset !== "custom";
+    $("#customProgressionInput").value = r.customProgression;
+    $("#nestedSeCornerBlock").hidden = r.nestingType !== "corner";
+    $("#nestedSeLat").value = r.seLat;
+    $("#nestedSeLon").value = r.seLon;
+    $("#nestedSeAlt").value = r.seAlt;
+    $("#nestedSeAcc").value = r.seAcc;
+    this._mapSe = this._mapSe || createLocationMap("nestedSeMap", "nestedSeMapWrap");
+    this._mapSe.update(r.seLat, r.seLon, r.seAcc);
+    $("#nestedDiagram").innerHTML = r.nestedEnabled ? nestedDiagramSvg(r.nestingType, activeProgression(r)) : "";
   },
 
   renderSpecies() {
@@ -970,16 +1502,27 @@ const ReleveEditor = {
       host.innerHTML = `<div class="empty-note">No species added yet.</div>`;
       return;
     }
-    host.innerHTML = r.species.map((s, i) => `
+    const sortMode = $("#releveSortSelect")?.value || "added";
+    const ordered = sortSpeciesForDisplay(r.species, sortMode, r.coverScale);
+    const sizes = r.nestedEnabled ? activeProgression(r) : [];
+    host.innerHTML = ordered.map(({ s, i }) => `
       <div class="species-row" data-i="${i}">
         <div class="sp-info">
-          <div class="sp-name">${esc(s.taxon)}${s.voiceUnconfirmed ? ` <button type="button" class="sp-unconfirmed-badge" title="Voice match — tap to confirm it's correct">unconfirmed</button>` : ""}</div>
-          <div class="sp-fam">${esc(s.family || "")}</div>
+          <div class="sp-name">${s.cf ? `<span class="cf-prefix">cf.</span> ` : ""}<button type="button" class="sp-name-btn" title="Tap to correct this species">${esc(s.taxon)}</button>${s.voiceUnconfirmed ? ` <button type="button" class="sp-unconfirmed-badge" title="Voice match — tap to confirm it's correct">unconfirmed</button>` : ""}${s.notInChecklist ? ` <span class="sp-freetext-tag" title="Typed as free text — not in the species database">not in checklist</span>` : ""}</div>
+          <div class="sp-fam">${esc(s.family || "")}${nativeTagHtml(s.native)}</div>
         </div>
         <select class="input small sp-layer">
           ${["herb", "shrub", "tree", "moss"].map(l => `<option value="${l}" ${l === s.layer ? "selected" : ""}>${l}</option>`).join("")}
         </select>
+        ${r.nestedEnabled ? `<select class="input small sp-grain" title="Smallest grain size found in">
+          ${sizes.map(sz => `<option value="${sz}" ${String(sz) === String(s.grain) ? "selected" : ""}>${areaEdgeLabel(sz)}</option>`).join("")}
+        </select>` : ""}
+        ${r.nestedEnabled && r.nestingType === "corner" ? `<select class="input small sp-corner" title="Which corner">
+          <option value="nw" ${s.corner === "nw" ? "selected" : ""}>NW</option>
+          <option value="se" ${s.corner === "se" ? "selected" : ""}>SE</option>
+        </select>` : ""}
         ${coverInputHtml(r.coverScale, s.cover)}
+        <button type="button" class="cf-toggle ${s.cf ? "active" : ""}" title="Mark as uncertain determination (cf.)">cf.</button>
         <button type="button" class="rm-btn" title="Remove">
           <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         </button>
@@ -988,11 +1531,28 @@ const ReleveEditor = {
     $all(".species-row", host).forEach(row => {
       const i = Number(row.dataset.i);
       $(".sp-layer", row).addEventListener("change", e => { r.species[i].layer = e.target.value; });
-      $(".sp-cover", row).addEventListener("change", e => { r.species[i].cover = e.target.value; });
+      $(".sp-cover", row).addEventListener("change", e => { r.species[i].cover = e.target.value; this.renderSpecies(); });
       $(".rm-btn", row).addEventListener("click", () => { r.species.splice(i, 1); this.renderSpecies(); });
+      $(".cf-toggle", row).addEventListener("click", () => { r.species[i].cf = !r.species[i].cf; this.renderSpecies(); });
+      $(".sp-name-btn", row).addEventListener("click", () => {
+        SpeciesCorrector.open(RELEVE_CORRECTOR_IDS, r.species[i].taxon, sp => this.replaceSpeciesAt(i, sp));
+      });
       const badge = $(".sp-unconfirmed-badge", row);
       if (badge) badge.addEventListener("click", () => { r.species[i].voiceUnconfirmed = false; this.renderSpecies(); });
+      const grainSel = $(".sp-grain", row);
+      if (grainSel) grainSel.addEventListener("change", e => { r.species[i].grain = e.target.value; });
+      const cornerSel = $(".sp-corner", row);
+      if (cornerSel) cornerSel.addEventListener("change", e => { r.species[i].corner = e.target.value; });
     });
+  },
+
+  replaceSpeciesAt(i, sp) {
+    const r = this.current;
+    const old = r.species[i];
+    if (!old) return;
+    r.species[i] = { ...old, taxon: sp.t, family: sp.f || "", native: sp.n || "", notInChecklist: !!sp.freeText, voiceUnconfirmed: false };
+    this.renderSpecies();
+    toast(`Updated to ${sp.t}`, "ok");
   },
 
   addSpecies(sp, opts) {
@@ -1002,7 +1562,13 @@ const ReleveEditor = {
       if (!opts.silent) toast("Already in the list");
       return { added: false };
     }
-    r.species.push({ taxon: sp.t, family: sp.f || "", layer: "herb", cover: "", voiceUnconfirmed: !!opts.unconfirmed });
+    const sizes = r.nestedEnabled ? activeProgression(r) : [];
+    r.species.push({
+      taxon: sp.t, family: sp.f || "", native: sp.n || "", layer: "herb", cover: "",
+      cf: false, voiceUnconfirmed: !!opts.unconfirmed, notInChecklist: !!sp.freeText,
+      loggedAt: Date.now(),
+      grain: sizes.length ? String(sizes[0]) : "", corner: "nw",
+    });
     this.renderSpecies();
     return { added: true };
   },
@@ -1026,6 +1592,10 @@ const ReleveEditor = {
     r.coverMoss = $("#coverMoss").value;
     r.coverScale = $("#coverScaleSelect").value;
     r.notes = $("#releveNotes").value;
+    r.seLat = $("#nestedSeLat").value;
+    r.seLon = $("#nestedSeLon").value;
+    r.seAlt = $("#nestedSeAlt").value;
+    r.seAcc = $("#nestedSeAcc").value;
   },
 
   async save() {
@@ -1034,6 +1604,29 @@ const ReleveEditor = {
     toast("Relevé saved", "ok");
     popView();
     Home.refresh();
+  },
+
+  // Clone plot structure + species list for fast repeat monitoring;
+  // GPS, date/time and photos reset since those are specific to this
+  // visit, not the plot description. Loads as an unsaved draft — the
+  // original record on disk is untouched until you hit Save.
+  async duplicate() {
+    this.readForm();
+    const src = this.current;
+    const copy = this.blank();
+    copy.coverScale = src.coverScale;
+    copy.assessmentMethod = src.assessmentMethod;
+    copy.nestedEnabled = src.nestedEnabled;
+    copy.nestingType = src.nestingType;
+    copy.progressionPreset = src.progressionPreset;
+    copy.customProgression = src.customProgression;
+    copy.area = src.area; copy.slope = src.slope; copy.aspect = src.aspect; copy.habitat = src.habitat;
+    copy.coverTree = src.coverTree; copy.coverShrub = src.coverShrub; copy.coverHerb = src.coverHerb; copy.coverMoss = src.coverMoss;
+    copy.species = src.species.map(s => ({ ...s }));
+    copy.notes = src.notes;
+    this.current = copy;
+    await this.render();
+    toast("Duplicated as a new draft — GPS and photos reset", "ok");
   },
 
   async remove() {
@@ -1056,7 +1649,7 @@ const ObservationEditor = {
   blank() {
     return {
       id: uid(), type: "observation", createdAt: Date.now(), updatedAt: Date.now(),
-      taxon: "", family: "",
+      taxon: "", family: "", native: "", cf: false, notInChecklist: false,
       date: todayDate(), time: nowTime(),
       lat: "", lon: "",
       photoIds: [], notes: "",
@@ -1067,6 +1660,7 @@ const ObservationEditor = {
     this.current = this.blank();
     this.render();
     pushView("observation");
+    this._gps.start();
   },
 
   async openExisting(id) {
@@ -1085,6 +1679,8 @@ const ObservationEditor = {
     $("#observationLon").value = s.lon;
     $("#observationNotes").value = s.notes;
     $("#observationGpsStatus").textContent = "";
+    this._map = this._map || createLocationMap("observationMap", "observationMapWrap");
+    this._map.update(s.lat, s.lon);
     this.renderTaxonChip();
     await renderPhotoGrid(s.photoIds, $("#observationPhotos"));
   },
@@ -1093,13 +1689,22 @@ const ObservationEditor = {
     const s = this.current;
     const host = $("#observationTaxonChip");
     if (!s.taxon) { host.innerHTML = ""; return; }
-    host.innerHTML = `<span class="chip" style="font-style:italic">${esc(s.taxon)}<button type="button" id="clearTaxonBtn">×</button></span>`;
-    $("#clearTaxonBtn").addEventListener("click", () => { s.taxon = ""; s.family = ""; this.renderTaxonChip(); });
+    host.innerHTML = `
+      <span class="chip">${s.cf ? "cf. " : ""}<button type="button" class="chip-name-btn" title="Tap to correct this species">${esc(s.taxon)}</button><button type="button" id="clearTaxonBtn">×</button></span>
+      ${s.notInChecklist ? `<span class="sp-freetext-tag" title="Typed as free text — not in the species database">not in checklist</span>` : ""}
+      <label class="check"><input type="checkbox" id="observationCfBox" ${s.cf ? "checked" : ""}><span>Uncertain determination (cf.)</span></label>`;
+    $("#clearTaxonBtn").addEventListener("click", () => { s.taxon = ""; s.family = ""; s.native = ""; s.notInChecklist = false; s.cf = false; this.renderTaxonChip(); });
+    $("#observationCfBox").addEventListener("change", e => { s.cf = e.target.checked; this.renderTaxonChip(); });
+    $(".chip-name-btn", host).addEventListener("click", () => {
+      SpeciesCorrector.open(OBSERVATION_CORRECTOR_IDS, s.taxon, sp => this.setTaxon(sp));
+    });
   },
 
   setTaxon(sp) {
     this.current.taxon = sp.t;
     this.current.family = sp.f || "";
+    this.current.native = sp.n || "";
+    this.current.notInChecklist = !!sp.freeText;
     this.renderTaxonChip();
   },
 
@@ -1114,7 +1719,12 @@ const ObservationEditor = {
 
   async save() {
     this.readForm();
-    if (!this.current.taxon) { toast("Pick a species first", "err"); return; }
+    // A species ID isn't required if there's a photo to identify from
+    // later — matches the "photograph now, determine later" workflow.
+    if (!this.current.taxon && !this.current.photoIds.length) {
+      toast("Pick a species or add a photo first", "err");
+      return;
+    }
     await Store.saveRecord(this.current);
     toast("Observation saved", "ok");
     popView();
@@ -1130,6 +1740,107 @@ const ObservationEditor = {
     Home.refresh();
   },
 };
+
+/* Display-only sorting for species lists — the underlying stored
+   array order (= order added / recorded time) never changes, so
+   switching sort mode is non-destructive and CSV/JSON export always
+   reflects the real recording order regardless of what's on screen. */
+const BB_COVER_ORDER = ["r", "+", "1", "2", "3", "4", "5"];
+const BB_EXT_COVER_ORDER = ["r", "+", "1", "2m", "2a", "2b", "3", "4", "5"];
+const SPECIES_LAYER_ORDER = { tree: 0, shrub: 1, herb: 2, moss: 3 };
+
+function coverRank(cover, scale) {
+  if (scale === "pct") { const n = Number(cover); return isNaN(n) ? -1 : n; }
+  const order = scale === "bb-ext" ? BB_EXT_COVER_ORDER : BB_COVER_ORDER;
+  const idx = order.indexOf(cover);
+  return idx === -1 ? -1 : idx;
+}
+
+function sortSpeciesForDisplay(species, mode, coverScale) {
+  const withIdx = species.map((s, i) => ({ s, i }));
+  switch (mode) {
+    case "alpha":
+      withIdx.sort((a, b) => a.s.taxon.localeCompare(b.s.taxon));
+      break;
+    case "family":
+      withIdx.sort((a, b) => (a.s.family || "").localeCompare(b.s.family || "") || a.s.taxon.localeCompare(b.s.taxon));
+      break;
+    case "cover":
+      withIdx.sort((a, b) => coverRank(b.s.cover, coverScale) - coverRank(a.s.cover, coverScale));
+      break;
+    case "layer":
+      withIdx.sort((a, b) => (SPECIES_LAYER_ORDER[a.s.layer] ?? 9) - (SPECIES_LAYER_ORDER[b.s.layer] ?? 9) || a.s.taxon.localeCompare(b.s.taxon));
+      break;
+    case "certainty":
+      withIdx.sort((a, b) => (a.s.certainty ?? 1) - (b.s.certainty ?? 1));
+      break;
+    default:
+      break; // "added" — keep original (recorded) order
+  }
+  return withIdx;
+}
+
+function nativeTagHtml(native) {
+  if (!native) return "";
+  const label = native.replace(/^CH_/, "").replace(/_/g, " ").toLowerCase();
+  return ` <span class="native-tag">· ${esc(label)}</span>`;
+}
+
+/* ---------------------------------------------------------- */
+/* tap-to-correct species picker — shared by relevé rows,      */
+/* transect rows, and the observation chip. Tapping a species   */
+/* name reuses the phonetic/fuzzy matcher (treating the current  */
+/* — possibly wrong — name as a "transcript") to suggest close    */
+/* matches, plus a normal type-to-search fallback.               */
+/* ---------------------------------------------------------- */
+
+const SpeciesCorrector = {
+  ids: null,
+  replaceFn: null,
+  wired: new Set(),
+
+  ensureWired(ids) {
+    if (this.wired.has(ids.box)) return;
+    this.wired.add(ids.box);
+    wireAutocomplete($(ids.input), $(ids.menu), sp => this.pick(sp));
+    $(ids.cancel).addEventListener("click", () => this.close());
+  },
+
+  open(ids, currentName, onReplace) {
+    this.ensureWired(ids);
+    this.ids = ids;
+    this.replaceFn = onReplace;
+    $(ids.label).textContent = `Correcting: ${currentName}`;
+    $(ids.input).value = "";
+    $(ids.menu).classList.remove("show");
+    const matches = fuzzyMatchTranscripts([currentName], 5);
+    const host = $(ids.suggestions);
+    host.innerHTML = matches.length
+      ? matches.map((m, i) => `<button type="button" class="btn btn-ghost full corrector-sugg" data-i="${i}"><span style="font-style:italic">${esc(m.sp.t)}</span><span class="hint">${Math.round(m.score * 100)}%</span></button>`).join("")
+      : `<div class="hint">No close matches — type to search.</div>`;
+    $all(".corrector-sugg", host).forEach(btn => {
+      btn.addEventListener("click", () => this.pick(matches[Number(btn.dataset.i)].sp));
+    });
+    $(ids.box).hidden = false;
+    $(ids.input).focus();
+  },
+
+  pick(sp) {
+    if (this.replaceFn) this.replaceFn(sp);
+    this.close();
+  },
+
+  close() {
+    if (this.ids) $(this.ids.box).hidden = true;
+    this.ids = null;
+    this.replaceFn = null;
+  },
+};
+
+const RELEVE_CORRECTOR_IDS = { box: "#speciesCorrectorBox", label: "#speciesCorrectorLabel", suggestions: "#speciesCorrectorSuggestions", input: "#speciesCorrectorInput", menu: "#speciesCorrectorMenu", cancel: "#speciesCorrectorCancelBtn" };
+const TRANSECT_CORRECTOR_IDS = { box: "#transectCorrectorBox", label: "#transectCorrectorLabel", suggestions: "#transectCorrectorSuggestions", input: "#transectCorrectorInput", menu: "#transectCorrectorMenu", cancel: "#transectCorrectorCancelBtn" };
+const OBSERVATION_CORRECTOR_IDS = { box: "#observationCorrectorBox", label: "#observationCorrectorLabel", suggestions: "#observationCorrectorSuggestions", input: "#observationCorrectorInput", menu: "#observationCorrectorMenu", cancel: "#observationCorrectorCancelBtn" };
+const REVIEW_CORRECTOR_IDS = { box: "#reviewReplaceBox", label: "#reviewReplaceLabel", suggestions: "#reviewReplaceSuggestions", input: "#reviewReplaceInput", menu: "#reviewReplaceMenu", cancel: "#reviewReplaceCancelBtn" };
 
 /* ============================================================
    TRANSECT EDITOR — a fast, "incomplete" walking survey: no plot
@@ -1162,6 +1873,9 @@ const TransectEditor = {
     this.current = this.blank();
     this.render();
     pushView("transect");
+    const locFold = $("#transectLocationFold");
+    if (locFold) locFold.open = true;
+    this._gps.start(() => { if (locFold) locFold.open = false; });
   },
 
   async openExisting(id) {
@@ -1184,6 +1898,8 @@ const TransectEditor = {
     $("#transectNotes").value = t.notes;
     $("#transectGpsStatus").textContent = "";
     $("#transectVoiceLogStatus").textContent = "";
+    this._map = this._map || createLocationMap("transectMap", "transectMapWrap");
+    this._map.update(t.lat, t.lon, t.acc);
     this.renderSpecies();
   },
 
@@ -1201,13 +1917,16 @@ const TransectEditor = {
       host.innerHTML = `<div class="empty-note">No species logged yet.</div>`;
       return;
     }
-    host.innerHTML = t.species.map((s, i) => `
+    const sortMode = $("#transectSortSelect")?.value || "added";
+    const ordered = sortSpeciesForDisplay(t.species, sortMode, null);
+    host.innerHTML = ordered.map(({ s, i }) => `
       <div class="species-row" data-i="${i}">
         <div class="sp-info">
-          <div class="sp-name">${esc(s.taxon)}</div>
-          <div class="sp-fam">${esc(s.family || "")}</div>
+          <div class="sp-name">${s.cf ? `<span class="cf-prefix">cf.</span> ` : ""}<button type="button" class="sp-name-btn" title="Tap to correct this species">${esc(s.taxon)}</button>${s.notInChecklist ? ` <span class="sp-freetext-tag" title="Typed as free text — not in the species database">not in checklist</span>` : ""}</div>
+          <div class="sp-fam">${esc(s.family || "")}${nativeTagHtml(s.native)}</div>
         </div>
         ${certaintyPillHtml(s)}
+        <button type="button" class="cf-toggle ${s.cf ? "active" : ""}" title="Mark as uncertain determination (cf.)">cf.</button>
         <button type="button" class="rm-btn" title="Remove">
           <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         </button>
@@ -1216,9 +1935,22 @@ const TransectEditor = {
     $all(".species-row", host).forEach(row => {
       const i = Number(row.dataset.i);
       $(".rm-btn", row).addEventListener("click", () => { t.species.splice(i, 1); this.renderSpecies(); });
+      $(".cf-toggle", row).addEventListener("click", () => { t.species[i].cf = !t.species[i].cf; this.renderSpecies(); });
+      $(".sp-name-btn", row).addEventListener("click", () => {
+        SpeciesCorrector.open(TRANSECT_CORRECTOR_IDS, t.species[i].taxon, sp => this.replaceSpeciesAt(i, sp));
+      });
       const pill = $(".certainty-pill", row);
       if (pill) pill.addEventListener("click", () => { t.species[i].reviewed = true; this.renderSpecies(); });
     });
+  },
+
+  replaceSpeciesAt(i, sp) {
+    const t = this.current;
+    const old = t.species[i];
+    if (!old) return;
+    t.species[i] = { ...old, taxon: sp.t, family: sp.f || "", native: sp.n || "", notInChecklist: !!sp.freeText, certainty: 1, reviewed: true, source: "manual" };
+    this.renderSpecies();
+    toast(`Updated to ${sp.t}`, "ok");
   },
 
   async addSpecies(sp, opts) {
@@ -1230,11 +1962,12 @@ const TransectEditor = {
     }
     const certainty = opts.score != null ? opts.score : 1;
     t.species.push({
-      taxon: sp.t, family: sp.f || "",
+      taxon: sp.t, family: sp.f || "", native: sp.n || "",
       certainty,
       reviewed: certainty >= VOICE_HIGH_CONF,
       source: opts.score != null ? "voice" : "manual",
       loggedAt: Date.now(),
+      cf: false, notInChecklist: !!sp.freeText,
     });
     this.renderSpecies();
 
@@ -1267,6 +2000,20 @@ const TransectEditor = {
     Home.refresh();
   },
 
+  // Clone the species list for fast repeat monitoring; GPS/date/time
+  // reset since those are specific to this visit. Loads as an unsaved
+  // draft — the original record on disk is untouched until Save.
+  duplicate() {
+    this.readForm();
+    const src = this.current;
+    const copy = this.blank();
+    copy.species = src.species.map(s => ({ ...s }));
+    copy.notes = src.notes;
+    this.current = copy;
+    this.render();
+    toast("Duplicated as a new draft — GPS reset", "ok");
+  },
+
   async remove() {
     if (!confirm("Delete this transect? This cannot be undone.")) return;
     await Store.deleteRecord(this.current.id);
@@ -1283,11 +2030,8 @@ const TransectEditor = {
    ============================================================ */
 
 const TransectReview = {
-  replacingIndex: null,
-
   open() {
-    this.replacingIndex = null;
-    $("#reviewReplaceBox").hidden = true;
+    SpeciesCorrector.close();
     this.render();
     pushView("transect-review");
   },
@@ -1311,15 +2055,12 @@ const TransectReview = {
       return `
       <div class="review-row" data-i="${i}">
         <div class="review-info">
-          <div class="review-name">${esc(s.taxon)}</div>
-          <div class="review-fam">${esc(s.family || "")}</div>
+          <div class="review-name">${s.cf ? `<span class="cf-prefix">cf.</span> ` : ""}<button type="button" class="sp-name-btn" title="Tap to correct this species">${esc(s.taxon)}</button></div>
+          <div class="review-fam">${esc(s.family || "")}${nativeTagHtml(s.native)}</div>
         </div>
         <span class="certainty-pill ${cls}">${pct}%</span>
         <button type="button" class="btn btn-icon review-approve" title="Approve">
           <svg viewBox="0 0 24 24" width="18" height="18"><path d="M5 13l4 4L19 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button type="button" class="btn btn-icon review-edit" title="Pick the correct species">
-          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 20h4l10-10-4-4L4 16z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         </button>
         <button type="button" class="btn btn-icon review-remove" title="Remove">
           <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -1337,34 +2078,20 @@ const TransectReview = {
         t.species.splice(i, 1);
         this.render(); TransectEditor.renderSpecies();
       });
-      $(".review-edit", row).addEventListener("click", () => { this.startReplace(i); });
+      $(".sp-name-btn", row).addEventListener("click", () => {
+        SpeciesCorrector.open(REVIEW_CORRECTOR_IDS, t.species[i].taxon, sp => this.replaceAt(i, sp));
+      });
     });
   },
 
-  startReplace(i) {
+  replaceAt(i, sp) {
     const t = TransectEditor.current;
-    this.replacingIndex = i;
-    $("#reviewReplaceLabel").textContent = `Replacing: ${t.species[i].taxon}`;
-    $("#reviewReplaceBox").hidden = false;
-    $("#reviewReplaceInput").value = "";
-    $("#reviewReplaceInput").focus();
-  },
-
-  finishReplace(sp) {
-    const t = TransectEditor.current;
-    if (this.replacingIndex == null) return;
-    t.species[this.replacingIndex] = {
-      taxon: sp.t, family: sp.f || "", certainty: 1, reviewed: true, source: "manual", loggedAt: Date.now(),
-    };
-    this.replacingIndex = null;
-    $("#reviewReplaceBox").hidden = true;
+    const old = t.species[i];
+    if (!old) return;
+    t.species[i] = { ...old, taxon: sp.t, family: sp.f || "", native: sp.n || "", notInChecklist: !!sp.freeText, certainty: 1, reviewed: true, source: "manual" };
     this.render();
     TransectEditor.renderSpecies();
-  },
-
-  cancelReplace() {
-    this.replacingIndex = null;
-    $("#reviewReplaceBox").hidden = true;
+    toast(`Updated to ${sp.t}`, "ok");
   },
 
   approveAllAbove(threshold) {
@@ -1378,18 +2105,367 @@ const TransectReview = {
 };
 
 /* ============================================================
+   EDGG PLOT EDITOR — the standardised nested-plot methodology for
+   grassland diversity (Dengler et al. 2016, Bull. EDGG 32: 13-30;
+   + second amendment, Dengler, Biurrun & Dembicz 2021, Palaearctic
+   Grasslands 49: 22-26). A 100 m² square with a full nested subplot
+   series (0.0001-10 m²) in two opposite corners (NW, SE), species
+   cover at 10 m², extensive structural/environmental variables per
+   10 m² plot, plus the optional 1000 m² extension, 100/1000 m²
+   cover spot-checks, and 4-fraction biomass sampling.
+   ============================================================ */
+
+const EDGG_GRAIN_SIZES = ["0.0001", "0.001", "0.01", "0.1", "1", "10"];
+const EDGG_GRAIN_EDGE_LABEL = { "0.0001": "1 cm", "0.001": "3.2 cm", "0.01": "10 cm", "0.1": "32 cm", "1": "1 m", "10": "3.16 m" };
+
+/* Schematic (not pixel-perfect to scale in the smallest insets — the
+   real range spans four orders of magnitude, same simplification the
+   original paper's own Fig. 1 uses) plot-design diagram. */
+function edggDiagramSvg(include1000) {
+  const pxPerM = 24;
+  const inner = 10 * pxPerM; // 100 m² edge = 10 m
+  if (!include1000) {
+    const pad = 50;
+    const size = inner + pad * 2;
+    const x0 = pad, y0 = pad, x1 = pad + inner, y1 = pad + inner;
+    return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:340px;display:block;margin:0 auto">
+      <rect x="${x0}" y="${y0}" width="${inner}" height="${inner}" fill="none" stroke="currentColor" stroke-width="2"/>
+      <line x1="${x0}" y1="${y1}" x2="${x1}" y2="${y0}" stroke="currentColor" stroke-width="1" stroke-dasharray="4 3" opacity="0.6"/>
+      <text x="${(x0+x1)/2+6}" y="${(y0+y1)/2-4}" font-size="9" fill="currentColor" opacity="0.7">diag. 14.14 m</text>
+      <rect x="${x0}" y="${y0}" width="50" height="50" fill="currentColor" opacity="0.12"/>
+      <rect x="${x0}" y="${y0}" width="26" height="26" fill="currentColor" opacity="0.18"/>
+      <rect x="${x0}" y="${y0}" width="10" height="10" fill="currentColor" opacity="0.28"/>
+      <text x="${x0+2}" y="${y0-6}" font-size="10" font-weight="700" fill="currentColor">NW</text>
+      <rect x="${x1-50}" y="${y1-50}" width="50" height="50" fill="currentColor" opacity="0.12"/>
+      <rect x="${x1-26}" y="${y1-26}" width="26" height="26" fill="currentColor" opacity="0.18"/>
+      <rect x="${x1-10}" y="${y1-10}" width="10" height="10" fill="currentColor" opacity="0.28"/>
+      <text x="${x1-24}" y="${y1+16}" font-size="10" font-weight="700" fill="currentColor">SE</text>
+      <text x="${x1-24}" y="${y0-6}" font-size="9" fill="currentColor" opacity="0.7">NE</text>
+      <text x="${x0+2}" y="${y1+16}" font-size="9" fill="currentColor" opacity="0.7">SW</text>
+    </svg>`;
+  }
+  const outer = 31.62 * pxPerM;
+  const pad = 46;
+  const size = outer + pad * 2;
+  const cx = size / 2, cy = size / 2;
+  const ox0 = cx - outer / 2, oy0 = cy - outer / 2;
+  const ix0 = cx - inner / 2, iy0 = cy - inner / 2;
+  return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:340px;display:block;margin:0 auto">
+    <rect x="${ox0}" y="${oy0}" width="${outer}" height="${outer}" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="6 4" opacity="0.85"/>
+    <text x="${cx}" y="${oy0-10}" font-size="10" fill="currentColor" text-anchor="middle">1000 m² (31.62 × 31.62 m), concentric</text>
+    <rect x="${ix0}" y="${iy0}" width="${inner}" height="${inner}" fill="none" stroke="currentColor" stroke-width="2"/>
+    <rect x="${ix0}" y="${iy0}" width="40" height="40" fill="currentColor" opacity="0.15"/>
+    <rect x="${ix0}" y="${iy0}" width="18" height="18" fill="currentColor" opacity="0.25"/>
+    <text x="${ix0+2}" y="${iy0-4}" font-size="9" font-weight="700" fill="currentColor">NW</text>
+    <rect x="${ix0+inner-40}" y="${iy0+inner-40}" width="40" height="40" fill="currentColor" opacity="0.15"/>
+    <rect x="${ix0+inner-18}" y="${iy0+inner-18}" width="18" height="18" fill="currentColor" opacity="0.25"/>
+    <text x="${ix0+inner-22}" y="${iy0+inner+14}" font-size="9" font-weight="700" fill="currentColor">SE</text>
+    <text x="${cx}" y="${oy0+outer+16}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">100 m² centred inside the 1000 m² extension</text>
+  </svg>`;
+}
+
+const EDGG_STRUCT_FIELD_KEYS = [
+  "CoverTree", "CoverShrub", "CoverHerb", "CoverCryptogam",
+  "HerbPhaner", "HerbChamae", "HerbGraminoid", "HerbLegume", "HerbOtherForb",
+  "MaxHeightTree", "MaxHeightShrub", "MaxHeightHerb",
+  "LitterCover",
+  "SoilStones", "SoilGravel", "SoilFine",
+  "Aspect", "Inclination", "Microrelief",
+  "SoilSkeleton", "SoilTexture", "SoilPh", "SoilHumus", "SoilC", "SoilN",
+  "LandUse", "Burned", "LandUseNotes",
+];
+function edggStructKeyToObjKey(k) { return k.charAt(0).toLowerCase() + k.slice(1); }
+
+function edggReadStructForm(Corner) {
+  const obj = {};
+  EDGG_STRUCT_FIELD_KEYS.forEach(k => {
+    const el = $("#edgg" + Corner + k);
+    if (!el) return;
+    obj[edggStructKeyToObjKey(k)] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  obj.stdHeight = [1, 2, 3, 4, 5].map(i => $("#edgg" + Corner + "StdHeight" + i)?.value || "");
+  obj.soilDepth = [1, 2, 3, 4, 5].map(i => $("#edgg" + Corner + "SoilDepth" + i)?.value || "");
+  return obj;
+}
+function edggRenderStructForm(Corner, obj) {
+  obj = obj || {};
+  EDGG_STRUCT_FIELD_KEYS.forEach(k => {
+    const el = $("#edgg" + Corner + k);
+    if (!el) return;
+    const v = obj[edggStructKeyToObjKey(k)];
+    if (el.type === "checkbox") el.checked = !!v;
+    else el.value = v || "";
+  });
+  [1, 2, 3, 4, 5].forEach(i => {
+    const hEl = $("#edgg" + Corner + "StdHeight" + i); if (hEl) hEl.value = (obj.stdHeight && obj.stdHeight[i - 1]) || "";
+    const dEl = $("#edgg" + Corner + "SoilDepth" + i); if (dEl) dEl.value = (obj.soilDepth && obj.soilDepth[i - 1]) || "";
+  });
+}
+function edggReadBiomass(Corner) {
+  return {
+    necromass: $("#edgg" + Corner + "BiomassNecromass").value,
+    bryo: $("#edgg" + Corner + "BiomassBryo").value,
+    herb: $("#edgg" + Corner + "BiomassHerb").value,
+    woody: $("#edgg" + Corner + "BiomassWoody").value,
+  };
+}
+function edggRenderBiomass(Corner, obj) {
+  obj = obj || {};
+  $("#edgg" + Corner + "BiomassNecromass").value = obj.necromass || "";
+  $("#edgg" + Corner + "BiomassBryo").value = obj.bryo || "";
+  $("#edgg" + Corner + "BiomassHerb").value = obj.herb || "";
+  $("#edgg" + Corner + "BiomassWoody").value = obj.woody || "";
+}
+
+const EDGG_NW_CORRECTOR_IDS = { box: "#edggNwCorrectorBox", label: "#edggNwCorrectorLabel", suggestions: "#edggNwCorrectorSuggestions", input: "#edggNwCorrectorInput", menu: "#edggNwCorrectorMenu", cancel: "#edggNwCorrectorCancelBtn" };
+const EDGG_SE_CORRECTOR_IDS = { box: "#edggSeCorrectorBox", label: "#edggSeCorrectorLabel", suggestions: "#edggSeCorrectorSuggestions", input: "#edggSeCorrectorInput", menu: "#edggSeCorrectorMenu", cancel: "#edggSeCorrectorCancelBtn" };
+
+const EdggEditor = {
+  current: null,
+
+  blank() {
+    return {
+      id: uid(), type: "edgg", createdAt: Date.now(), updatedAt: Date.now(),
+      name: "EDGG-" + todayDate().replace(/-/g, "") + "-" + Math.floor(Math.random() * 90 + 10),
+      date: todayDate(), time: nowTime(),
+      include1000: false, orientationDev: "",
+      nwLat: "", nwLon: "", nwAlt: "", nwAcc: "",
+      seLat: "", seLon: "", seAlt: "", seAcc: "",
+      nwSpecies: [], seSpecies: [],
+      cover100: [], cover1000: [],
+      struct: { nw: {}, se: {} },
+      biomassEnable: false, biomassCorner: "both",
+      biomass: { nw: {}, se: {} },
+      photoIds: [], notes: "",
+    };
+  },
+
+  openNew() {
+    this.current = this.blank();
+    this.render();
+    pushView("edgg");
+    this._gpsNw.start();
+    this._gpsSe.start();
+  },
+
+  async openExisting(id) {
+    const rec = await Store.getRecord(id);
+    if (!rec) return;
+    this.current = rec;
+    await this.render();
+    pushView("edgg");
+  },
+
+  async render() {
+    const e = this.current;
+    $("#edggName").value = e.name;
+    $("#edggDate").value = e.date;
+    $("#edggTime").value = e.time;
+    $("#edggOrientationDev").value = e.orientationDev;
+    $("#edgg1000Toggle").checked = !!e.include1000;
+    $("#edgg1000Instructions").hidden = !e.include1000;
+    $("#edggCover1000Section").hidden = !e.include1000;
+    $("#edggDiagram").innerHTML = edggDiagramSvg(!!e.include1000);
+
+    $("#edggNwLat").value = e.nwLat; $("#edggNwLon").value = e.nwLon; $("#edggNwAlt").value = e.nwAlt; $("#edggNwAcc").value = e.nwAcc;
+    $("#edggSeLat").value = e.seLat; $("#edggSeLon").value = e.seLon; $("#edggSeAlt").value = e.seAlt; $("#edggSeAcc").value = e.seAcc;
+    $("#edggNwGpsStatus").textContent = ""; $("#edggSeGpsStatus").textContent = "";
+    this._mapNw = this._mapNw || createLocationMap("edggNwMap", "edggNwMapWrap");
+    this._mapNw.update(e.nwLat, e.nwLon, e.nwAcc);
+    this._mapSe = this._mapSe || createLocationMap("edggSeMap", "edggSeMapWrap");
+    this._mapSe.update(e.seLat, e.seLon, e.seAcc);
+
+    edggRenderStructForm("Nw", e.struct.nw);
+    edggRenderStructForm("Se", e.struct.se);
+
+    $("#edggBiomassEnable").checked = !!e.biomassEnable;
+    $("#edggBiomassFields").hidden = !e.biomassEnable;
+    $("#edggBiomassCorner").value = e.biomassCorner || "both";
+    $("#edggBiomassNw").hidden = e.biomassCorner === "se";
+    $("#edggBiomassSe").hidden = e.biomassCorner === "nw";
+    edggRenderBiomass("Nw", e.biomass.nw);
+    edggRenderBiomass("Se", e.biomass.se);
+
+    $("#edggNotes").value = e.notes;
+    this.renderSpecies("nw");
+    this.renderSpecies("se");
+    this.renderCoverList("cover100");
+    this.renderCoverList("cover1000");
+    await renderPhotoGrid(e.photoIds, $("#edggPhotos"));
+  },
+
+  renderSpecies(corner) {
+    const e = this.current;
+    const Corner = corner === "nw" ? "Nw" : "Se";
+    const arr = corner === "nw" ? e.nwSpecies : e.seSpecies;
+    const ids = corner === "nw" ? EDGG_NW_CORRECTOR_IDS : EDGG_SE_CORRECTOR_IDS;
+    $("#edgg" + Corner + "SpeciesCount").textContent = arr.length ? arr.length : "";
+    const host = $("#edgg" + Corner + "SpeciesTable");
+    if (!arr.length) { host.innerHTML = `<div class="empty-note">No species recorded yet.</div>`; return; }
+
+    const sortMode = $("#edgg" + Corner + "SortSelect")?.value || "added";
+    const ordered = sortMode === "grain"
+      ? arr.map((s, i) => ({ s, i })).sort((a, b) => EDGG_GRAIN_SIZES.indexOf(a.s.grain) - EDGG_GRAIN_SIZES.indexOf(b.s.grain))
+      : sortSpeciesForDisplay(arr, sortMode, null);
+
+    host.innerHTML = ordered.map(({ s, i }) => `
+      <div class="species-row" data-i="${i}">
+        <div class="sp-info">
+          <div class="sp-name">${s.cf ? `<span class="cf-prefix">cf.</span> ` : ""}<button type="button" class="sp-name-btn" title="Tap to correct this species">${esc(s.taxon)}</button>${s.voiceUnconfirmed ? ` <button type="button" class="sp-unconfirmed-badge" title="Voice match — tap to confirm it's correct">unconfirmed</button>` : ""}${s.notInChecklist ? ` <span class="sp-freetext-tag">not in checklist</span>` : ""}</div>
+          <div class="sp-fam">${esc(s.family || "")}${nativeTagHtml(s.native)}</div>
+        </div>
+        <select class="input small sp-grain" title="Smallest grain size found">
+          ${EDGG_GRAIN_SIZES.map(g => `<option value="${g}" ${g === s.grain ? "selected" : ""}>${g} m²</option>`).join("")}
+        </select>
+        <input type="number" class="input small sp-cover10" min="0" max="100" step="0.1" placeholder="cov.%" value="${esc(s.cover ?? "")}">
+        <button type="button" class="cf-toggle ${s.cf ? "active" : ""}" title="Mark as uncertain determination (cf.)">cf.</button>
+        <button type="button" class="rm-btn" title="Remove">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>`).join("");
+
+    $all(".species-row", host).forEach(row => {
+      const i = Number(row.dataset.i);
+      $(".sp-grain", row).addEventListener("change", ev => { arr[i].grain = ev.target.value; });
+      $(".sp-cover10", row).addEventListener("change", ev => { arr[i].cover = ev.target.value; });
+      $(".rm-btn", row).addEventListener("click", () => { arr.splice(i, 1); this.renderSpecies(corner); });
+      $(".cf-toggle", row).addEventListener("click", () => { arr[i].cf = !arr[i].cf; this.renderSpecies(corner); });
+      $(".sp-name-btn", row).addEventListener("click", () => {
+        SpeciesCorrector.open(ids, arr[i].taxon, sp => this.replaceSpeciesAt(corner, i, sp));
+      });
+      const badge = $(".sp-unconfirmed-badge", row);
+      if (badge) badge.addEventListener("click", () => { arr[i].voiceUnconfirmed = false; this.renderSpecies(corner); });
+    });
+  },
+
+  async addSpecies(corner, sp, opts) {
+    opts = opts || {};
+    const e = this.current;
+    const arr = corner === "nw" ? e.nwSpecies : e.seSpecies;
+    if (arr.some(s => s.taxon === sp.t)) {
+      if (!opts.silent) toast("Already in the list");
+      return { added: false };
+    }
+    arr.push({
+      taxon: sp.t, family: sp.f || "", native: sp.n || "", grain: "10", cover: "",
+      cf: false, voiceUnconfirmed: !!opts.unconfirmed, notInChecklist: !!sp.freeText, loggedAt: Date.now(),
+    });
+    this.renderSpecies(corner);
+    return { added: true };
+  },
+
+  replaceSpeciesAt(corner, i, sp) {
+    const e = this.current;
+    const arr = corner === "nw" ? e.nwSpecies : e.seSpecies;
+    const old = arr[i];
+    if (!old) return;
+    arr[i] = { ...old, taxon: sp.t, family: sp.f || "", native: sp.n || "", notInChecklist: !!sp.freeText, voiceUnconfirmed: false };
+    this.renderSpecies(corner);
+    toast(`Updated to ${sp.t}`, "ok");
+  },
+
+  renderCoverList(key) {
+    const e = this.current;
+    const arr = e[key];
+    const host = $("#edgg" + (key === "cover100" ? "Cover100List" : "Cover1000List"));
+    if (key === "cover100") $("#edgg100CoverCount").textContent = arr.length ? arr.length : "";
+    if (!arr.length) { host.innerHTML = `<div class="empty-note">No spot-check entries yet.</div>`; return; }
+    host.innerHTML = arr.map((s, i) => `
+      <div class="species-row" data-i="${i}">
+        <div class="sp-info">
+          <div class="sp-name">${esc(s.taxon)}</div>
+          <div class="sp-fam">${esc(s.family || "")}${nativeTagHtml(s.native)}</div>
+        </div>
+        <input type="number" class="input small sp-cover10" min="0" max="100" step="0.001" placeholder="cov.%" value="${esc(s.cover ?? "")}">
+        <button type="button" class="rm-btn" title="Remove">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>`).join("");
+    $all(".species-row", host).forEach(row => {
+      const i = Number(row.dataset.i);
+      $(".sp-cover10", row).addEventListener("change", ev => { arr[i].cover = ev.target.value; });
+      $(".rm-btn", row).addEventListener("click", () => { arr.splice(i, 1); this.renderCoverList(key); });
+    });
+  },
+
+  addCoverEntry(key, sp) {
+    const arr = this.current[key];
+    if (arr.some(s => s.taxon === sp.t)) { toast("Already in the list"); return; }
+    arr.push({ taxon: sp.t, family: sp.f || "", native: sp.n || "", cover: "" });
+    this.renderCoverList(key);
+  },
+
+  readForm() {
+    const e = this.current;
+    e.name = $("#edggName").value.trim() || e.name;
+    e.date = $("#edggDate").value;
+    e.time = $("#edggTime").value;
+    e.orientationDev = $("#edggOrientationDev").value;
+    e.include1000 = $("#edgg1000Toggle").checked;
+    e.nwLat = $("#edggNwLat").value; e.nwLon = $("#edggNwLon").value; e.nwAlt = $("#edggNwAlt").value; e.nwAcc = $("#edggNwAcc").value;
+    e.seLat = $("#edggSeLat").value; e.seLon = $("#edggSeLon").value; e.seAlt = $("#edggSeAlt").value; e.seAcc = $("#edggSeAcc").value;
+    e.struct.nw = edggReadStructForm("Nw");
+    e.struct.se = edggReadStructForm("Se");
+    e.biomassEnable = $("#edggBiomassEnable").checked;
+    e.biomassCorner = $("#edggBiomassCorner").value;
+    if (e.biomassCorner !== "se") e.biomass.nw = edggReadBiomass("Nw");
+    if (e.biomassCorner !== "nw") e.biomass.se = edggReadBiomass("Se");
+    e.notes = $("#edggNotes").value;
+  },
+
+  async save() {
+    this.readForm();
+    await Store.saveRecord(this.current);
+    toast("EDGG plot saved", "ok");
+    popView();
+    Home.refresh();
+  },
+
+  async duplicate() {
+    this.readForm();
+    const src = this.current;
+    const copy = this.blank();
+    copy.include1000 = src.include1000;
+    copy.orientationDev = src.orientationDev;
+    copy.nwSpecies = src.nwSpecies.map(s => ({ ...s }));
+    copy.seSpecies = src.seSpecies.map(s => ({ ...s }));
+    copy.cover100 = src.cover100.map(s => ({ ...s }));
+    copy.cover1000 = src.cover1000.map(s => ({ ...s }));
+    copy.struct = { nw: { ...src.struct.nw }, se: { ...src.struct.se } };
+    copy.biomassEnable = src.biomassEnable;
+    copy.biomassCorner = src.biomassCorner;
+    copy.notes = src.notes;
+    this.current = copy;
+    await this.render();
+    toast("Duplicated as a new draft — GPS and photos reset", "ok");
+  },
+
+  async remove() {
+    if (!confirm("Delete this EDGG plot? This cannot be undone.")) return;
+    for (const id of this.current.photoIds) await Store.deletePhoto(id);
+    await Store.deleteRecord(this.current.id);
+    toast("EDGG plot deleted");
+    popView();
+    Home.refresh();
+  },
+};
+
+/* ============================================================
    RECORD LIST RENDERING (shared by Home + Records views)
    ============================================================ */
 
 function recordIcon(type) {
   if (type === "releve") return `<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
   if (type === "transect") return `<svg viewBox="0 0 24 24"><path d="M3 18c4-8 6 6 10-2 2-4 4-4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="12.2" r="1.4" fill="currentColor"/><circle cx="13.3" cy="14.8" r="1.4" fill="currentColor"/><circle cx="19" cy="11.5" r="1.4" fill="currentColor"/></svg>`;
+  if (type === "edgg") return `<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="3" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="14" y="14" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>`;
   return `<svg viewBox="0 0 24 24"><path d="M12 21s-7-5.2-7-10.5C5 6.9 8.1 4 12 4s7 2.9 7 6.5C19 15.8 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="10.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`;
 }
 
 function recordTitle(rec) {
-  if (rec.type === "releve" || rec.type === "transect") return rec.name || (rec.type === "releve" ? "Relevé" : "Transect");
-  return rec.taxon || "Observation";
+  if (rec.type === "releve" || rec.type === "transect" || rec.type === "edgg") {
+    return rec.name || (rec.type === "releve" ? "Relevé" : rec.type === "edgg" ? "EDGG plot" : "Transect");
+  }
+  return rec.taxon || "Unidentified";
 }
 function recordSub(rec) {
   const bits = [rec.date];
@@ -1397,8 +2473,11 @@ function recordSub(rec) {
   else if (rec.type === "transect") {
     const unreviewed = rec.species.filter(s => !s.reviewed).length;
     bits.push(`${rec.species.length} spp.${unreviewed ? `, ${unreviewed} to review` : ""}`);
+  } else if (rec.type === "edgg") {
+    const n = new Set([...rec.nwSpecies.map(s => s.taxon), ...rec.seSpecies.map(s => s.taxon)]).size;
+    bits.push(`${n} spp.`, rec.include1000 ? "100+1000 m²" : "100 m²");
   } else if (rec.family) bits.push(rec.family);
-  if (rec.lat && rec.lon) bits.push("GPS");
+  if ((rec.lat && rec.lon) || (rec.nwLat && rec.nwLon)) bits.push("GPS");
   return bits.filter(Boolean).join(" · ");
 }
 
@@ -1422,6 +2501,7 @@ function renderRecordList(records, hostEl) {
       const id = el.dataset.id, type = el.dataset.type;
       if (type === "releve") ReleveEditor.openExisting(id);
       else if (type === "transect") TransectEditor.openExisting(id);
+      else if (type === "edgg") EdggEditor.openExisting(id);
       else ObservationEditor.openExisting(id);
     });
   });
@@ -1438,9 +2518,11 @@ const Home = {
     const releveCount = records.filter(r => r.type === "releve").length;
     const observationCount = records.filter(r => r.type === "observation").length;
     const transectCount = records.filter(r => r.type === "transect").length;
+    const edggCount = records.filter(r => r.type === "edgg").length;
     const speciesSet = new Set();
     records.forEach(r => {
       if (r.type === "releve" || r.type === "transect") r.species.forEach(s => speciesSet.add(s.taxon));
+      else if (r.type === "edgg") { r.nwSpecies.forEach(s => speciesSet.add(s.taxon)); r.seSpecies.forEach(s => speciesSet.add(s.taxon)); }
       else if (r.taxon) speciesSet.add(r.taxon);
     });
 
@@ -1448,6 +2530,7 @@ const Home = {
       <div class="stat-card"><div class="n">${releveCount}</div><div class="l">Relevés</div></div>
       <div class="stat-card"><div class="n">${transectCount}</div><div class="l">Transects</div></div>
       <div class="stat-card"><div class="n">${observationCount}</div><div class="l">Observations</div></div>
+      <div class="stat-card"><div class="n">${edggCount}</div><div class="l">EDGG plots</div></div>
       <div class="stat-card"><div class="n">${speciesSet.size}</div><div class="l">Taxa recorded</div></div>
     `;
 
@@ -1473,6 +2556,8 @@ const Records = {
         ? [r.name, r.habitat, ...r.species.map(s => s.taxon)].join(" ").toLowerCase()
         : r.type === "transect"
         ? [r.name, r.notes, ...r.species.map(s => s.taxon)].join(" ").toLowerCase()
+        : r.type === "edgg"
+        ? [r.name, r.notes, ...r.nwSpecies.map(s => s.taxon), ...r.seSpecies.map(s => s.taxon)].join(" ").toLowerCase()
         : [r.taxon, r.family, r.notes].join(" ").toLowerCase();
       return hay.includes(q);
     });
@@ -1484,6 +2569,74 @@ const Records = {
    SETTINGS VIEW
    ============================================================ */
 
+/* ============================================================
+   AI-ENHANCED VOICE MATCHING (experimental, on-device Whisper)
+   Lazily imports whisper.js (which itself imports the vendored
+   transformers.js + fetches model weights from the HF Hub CDN on
+   first use) only once the user opts in — nothing here downloads
+   or runs at normal page load. See whisper.js for the actual
+   audio-conditioned scoring implementation.
+   ============================================================ */
+
+const AiVoice = {
+  mod: null,       // window.WhisperVoice, once whisper.js has been imported
+  loading: false,
+  error: null,
+
+  setStatus(text) { const el = $("#aiVoiceStatus"); if (el) el.textContent = text || ""; },
+
+  async ensureModuleImported() {
+    if (this.mod) return this.mod;
+    await import("./whisper.js");
+    this.mod = window.WhisperVoice;
+    return this.mod;
+  },
+
+  async ensureLoaded() {
+    if (this.mod && this.mod.isLoaded()) return true;
+    if (this.loading) return false;
+    this.loading = true;
+    this.error = null;
+    $("#aiVoiceDownloadBtn").hidden = true;
+    try {
+      const mod = await this.ensureModuleImported();
+      if (!mod.isSupported()) {
+        this.error = "Not supported in this browser (needs WebAssembly + microphone access).";
+        this.setStatus(this.error);
+        return false;
+      }
+      this.setStatus("Preparing…");
+      await mod.loadModel(p => {
+        if (p && p.status === "progress" && p.total) {
+          const pct = Math.round((p.loaded / p.total) * 100);
+          this.setStatus(`Downloading model — ${p.file || ""} ${pct}%`);
+        } else if (p && p.status === "ready") {
+          this.setStatus("Ready.");
+        }
+      });
+      this.setStatus("Ready — on-device voice matching is active.");
+      return true;
+    } catch (e) {
+      console.error(e);
+      this.error = "Couldn't load the model: " + (e.message || e);
+      this.setStatus(this.error);
+      $("#aiVoiceDownloadBtn").hidden = false;
+      return false;
+    } finally {
+      this.loading = false;
+    }
+  },
+
+  async refreshStatus() {
+    const settings = await Store.getSettings();
+    $("#aiVoiceEnabled").checked = !!settings.aiVoiceEnabled;
+    if (!settings.aiVoiceEnabled) { this.setStatus(""); $("#aiVoiceDownloadBtn").hidden = true; return; }
+    if (this.mod && this.mod.isLoaded()) { this.setStatus("Ready — on-device voice matching is active."); return; }
+    if (this.error) { this.setStatus(this.error); $("#aiVoiceDownloadBtn").hidden = false; return; }
+    this.ensureLoaded();
+  },
+};
+
 const Settings = {
   async refresh() {
     $("#appVersion").textContent = APP_VERSION;
@@ -1492,6 +2645,7 @@ const Settings = {
     $("#gpsThresholdInput").value = settings.gpsThreshold || 10;
     $("#voiceSpeakFeedback").checked = settings.voiceSpeakFeedback !== false;
     $("#voiceReviewCheckpointInput").value = settings.voiceReviewCheckpoint || 30;
+    await AiVoice.refreshStatus();
 
     $("#speciesPackList").innerHTML = Species.packs.map(p => `
       <div class="tx-item">
@@ -1533,21 +2687,49 @@ async function exportCsv() {
   const observations = records.filter(r => r.type === "observation");
   const transects = records.filter(r => r.type === "transect");
 
-  const releveRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "area_m2", "slope_deg", "aspect", "habitat", "cover_tree_pct", "cover_shrub_pct", "cover_herb_pct", "cover_moss_pct", "cover_scale", "species_count", "notes"]];
-  const speciesRows = [["releve_id", "releve_name", "taxon", "family", "layer", "cover"]];
+  const releveRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "area_m2", "slope_deg", "aspect", "habitat", "cover_tree_pct", "cover_shrub_pct", "cover_herb_pct", "cover_moss_pct", "cover_scale", "assessment_method", "nested_enabled", "nesting_type", "progression_preset", "area_progression_m2", "se_lat", "se_lon", "species_count", "notes"]];
+  const speciesRows = [["releve_id", "releve_name", "taxon", "family", "native", "cf", "not_in_checklist", "layer", "cover", "grain_m2", "corner", "logged_at"]];
   releves.forEach(r => {
-    releveRows.push([r.id, r.name, r.date, r.time, r.lat, r.lon, r.alt, r.acc, r.area, r.slope, r.aspect, r.habitat, r.coverTree, r.coverShrub, r.coverHerb, r.coverMoss, r.coverScale, r.species.length, r.notes]);
-    r.species.forEach(s => speciesRows.push([r.id, r.name, s.taxon, s.family, s.layer, s.cover]));
+    releveRows.push([r.id, r.name, r.date, r.time, r.lat, r.lon, r.alt, r.acc, r.area, r.slope, r.aspect, r.habitat, r.coverTree, r.coverShrub, r.coverHerb, r.coverMoss, r.coverScale, r.assessmentMethod || "", r.nestedEnabled ? "yes" : "no", r.nestedEnabled ? r.nestingType : "", r.nestedEnabled ? r.progressionPreset : "", r.nestedEnabled ? activeProgression(r).join("/") : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLat : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLon : "", r.species.length, r.notes]);
+    r.species.forEach(s => speciesRows.push([r.id, r.name, s.taxon, s.family, s.native || "", s.cf ? "yes" : "no", s.notInChecklist ? "yes" : "no", s.layer, s.cover, r.nestedEnabled ? (s.grain || "") : "", r.nestedEnabled && r.nestingType === "corner" ? (s.corner || "") : "", s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
   });
 
-  const observationRows = [["id", "taxon", "family", "date", "time", "lat", "lon", "notes"]];
-  observations.forEach(s => observationRows.push([s.id, s.taxon, s.family, s.date, s.time, s.lat, s.lon, s.notes]));
+  const observationRows = [["id", "taxon", "family", "native", "cf", "not_in_checklist", "date", "time", "lat", "lon", "notes"]];
+  observations.forEach(s => observationRows.push([s.id, s.taxon, s.family, s.native || "", s.cf ? "yes" : "no", s.notInChecklist ? "yes" : "no", s.date, s.time, s.lat, s.lon, s.notes]));
 
   const transectRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "species_count", "notes"]];
-  const transectSpeciesRows = [["transect_id", "transect_name", "taxon", "family", "certainty", "reviewed", "source", "logged_at"]];
+  const transectSpeciesRows = [["transect_id", "transect_name", "taxon", "family", "native", "cf", "not_in_checklist", "certainty", "reviewed", "source", "logged_at"]];
   transects.forEach(t => {
     transectRows.push([t.id, t.name, t.date, t.time, t.lat, t.lon, t.alt, t.acc, t.species.length, t.notes]);
-    t.species.forEach(s => transectSpeciesRows.push([t.id, t.name, s.taxon, s.family, (s.certainty ?? 1).toFixed(2), s.reviewed ? "yes" : "no", s.source || "", s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
+    t.species.forEach(s => transectSpeciesRows.push([t.id, t.name, s.taxon, s.family, s.native || "", s.cf ? "yes" : "no", s.notInChecklist ? "yes" : "no", (s.certainty ?? 1).toFixed(2), s.reviewed ? "yes" : "no", s.source || "", s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
+  });
+
+  const edggPlots = records.filter(r => r.type === "edgg");
+  const edggRows = [["id", "name", "date", "time", "include_1000m2", "orientation_deviation_deg", "nw_lat", "nw_lon", "nw_alt", "nw_accuracy_m", "se_lat", "se_lon", "se_alt", "se_accuracy_m", "nw_species_count", "se_species_count", "biomass_sampled", "biomass_corner", "notes"]];
+  const edggSpeciesRows = [["plot_id", "plot_name", "corner", "taxon", "family", "native", "cf", "not_in_checklist", "smallest_grain_m2", "cover_10m2_pct", "logged_at"]];
+  const edggCoverRows = [["plot_id", "plot_name", "plot_size", "taxon", "family", "native", "cover_pct"]];
+  const structKeys = EDGG_STRUCT_FIELD_KEYS.map(edggStructKeyToObjKey);
+  const edggStructRows = [["plot_id", "plot_name", "corner", ...structKeys, "std_height_1_5_cm", "soil_depth_1_5_cm"]];
+  const edggBiomassRows = [["plot_id", "plot_name", "corner", "necromass_g_per_m2", "bryophytes_lichens_g_per_m2", "herbs_g_per_m2", "woody_g_per_m2"]];
+  edggPlots.forEach(e => {
+    edggRows.push([e.id, e.name, e.date, e.time, e.include1000 ? "yes" : "no", e.orientationDev, e.nwLat, e.nwLon, e.nwAlt, e.nwAcc, e.seLat, e.seLon, e.seAlt, e.seAcc, e.nwSpecies.length, e.seSpecies.length, e.biomassEnable ? "yes" : "no", e.biomassEnable ? e.biomassCorner : "", e.notes]);
+    [["NW", e.nwSpecies], ["SE", e.seSpecies]].forEach(([corner, arr]) => {
+      arr.forEach(s => edggSpeciesRows.push([e.id, e.name, corner, s.taxon, s.family, s.native || "", s.cf ? "yes" : "no", s.notInChecklist ? "yes" : "no", s.grain, s.cover, s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
+    });
+    e.cover100.forEach(s => edggCoverRows.push([e.id, e.name, "100", s.taxon, s.family, s.native || "", s.cover]));
+    e.cover1000.forEach(s => edggCoverRows.push([e.id, e.name, "1000", s.taxon, s.family, s.native || "", s.cover]));
+    [["NW", e.struct.nw], ["SE", e.struct.se]].forEach(([corner, st]) => {
+      st = st || {};
+      edggStructRows.push([e.id, e.name, corner, ...structKeys.map(k => st[k] ?? ""), (st.stdHeight || []).join("/"), (st.soilDepth || []).join("/")]);
+    });
+    if (e.biomassEnable) {
+      [["NW", e.biomass.nw], ["SE", e.biomass.se]].forEach(([corner, b]) => {
+        if (e.biomassCorner !== "both" && e.biomassCorner.toUpperCase() !== corner) return;
+        b = b || {};
+        const perM2 = v => v === "" || v == null || isNaN(Number(v)) ? "" : (Number(v) / 0.08).toFixed(1);
+        edggBiomassRows.push([e.id, e.name, corner, perM2(b.necromass), perM2(b.bryo), perM2(b.herb), perM2(b.woody)]);
+      });
+    }
   });
 
   const zipLike = [
@@ -1556,6 +2738,11 @@ async function exportCsv() {
     "# observations.csv\n" + toCsv(observationRows),
     "# transects.csv\n" + toCsv(transectRows),
     "# transects_species.csv\n" + toCsv(transectSpeciesRows),
+    "# edgg_plots.csv\n" + toCsv(edggRows),
+    "# edgg_species.csv\n" + toCsv(edggSpeciesRows),
+    "# edgg_cover_spotcheck.csv\n" + toCsv(edggCoverRows),
+    "# edgg_structural.csv\n" + toCsv(edggStructRows),
+    "# edgg_biomass.csv\n" + toCsv(edggBiomassRows),
   ].join("\n\n");
 
   downloadBlob(new Blob([zipLike], { type: "text/csv" }), `isurvey-export-${todayDate()}.csv`);
@@ -1627,44 +2814,126 @@ function wireHome() {
   $("#newReleveBtn").addEventListener("click", () => ReleveEditor.openNew());
   $("#newObservationBtn").addEventListener("click", () => ObservationEditor.openNew());
   $("#newTransectBtn").addEventListener("click", () => TransectEditor.openNew());
+  $("#newEdggBtn").addEventListener("click", () => EdggEditor.openNew());
   $("#seeAllBtn").addEventListener("click", () => { resetToTab("records"); pushView("records"); Records.refresh(); });
 }
 
+/* Keep a location map in sync with its lat/lon fields (typed edits
+   and GPS-capture updates alike), and fix Leaflet's sizing when its
+   <details> fold is opened after being hidden. */
+function wireLiveMapUpdates(latEl, lonEl, getMap, accEl) {
+  const update = () => { const m = getMap(); if (m) m.update(latEl.value, lonEl.value, accEl ? accEl.value : null); };
+  latEl.addEventListener("input", update);
+  lonEl.addEventListener("input", update);
+  if (accEl) accEl.addEventListener("input", update);
+  const fold = latEl.closest("details.fold");
+  if (fold) fold.addEventListener("toggle", () => { if (fold.open) { const m = getMap(); if (m) m.invalidate(); } });
+}
+
 function wireTransectEditor() {
-  wireGpsButton($("#transectGpsBtn"), $("#transectGpsStatus"), $("#transectLat"), $("#transectLon"), $("#transectAlt"), $("#transectAcc"));
+  TransectEditor._gps = wireGpsButton($("#transectGpsBtn"), $("#transectGpsStatus"), $("#transectLat"), $("#transectLon"), $("#transectAlt"), $("#transectAcc"), "transect");
+  wireLiveMapUpdates($("#transectLat"), $("#transectLon"), () => TransectEditor._map, $("#transectAcc"));
   wireAutocomplete($("#transectSearchInput"), $("#transectAcMenu"), sp => TransectEditor.addSpecies(sp));
   wireVoiceLogging($("#transectVoiceLogBtn"), $("#transectVoiceLogStatus"), "transect", (sp, opts) => TransectEditor.addSpecies(sp, opts));
   $("#transectReviewBtn").addEventListener("click", () => TransectReview.open());
+  $("#transectSortSelect").addEventListener("change", () => TransectEditor.renderSpecies());
   $("#transectSaveBtn").addEventListener("click", () => TransectEditor.save());
+  $("#transectDuplicateBtn").addEventListener("click", () => TransectEditor.duplicate());
   $("#transectDeleteBtn").addEventListener("click", () => TransectEditor.remove());
 }
 
 function wireTransectReview() {
-  wireAutocomplete($("#reviewReplaceInput"), $("#reviewReplaceMenu"), sp => TransectReview.finishReplace(sp));
-  $("#reviewReplaceCancelBtn").addEventListener("click", () => TransectReview.cancelReplace());
   $("#reviewApproveAllBtn").addEventListener("click", () => TransectReview.approveAllAbove(0.9));
 }
 
 function wireReleveEditor() {
-  wireGpsButton($("#releveGpsBtn"), $("#releveGpsStatus"), $("#releveLat"), $("#releveLon"), $("#releveAlt"), $("#releveAcc"));
+  ReleveEditor._gps = wireGpsButton($("#releveGpsBtn"), $("#releveGpsStatus"), $("#releveLat"), $("#releveLon"), $("#releveAlt"), $("#releveAcc"), "releve");
+  wireLiveMapUpdates($("#releveLat"), $("#releveLon"), () => ReleveEditor._map, $("#releveAcc"));
   wireAutocomplete($("#speciesSearchInput"), $("#speciesAcMenu"), sp => ReleveEditor.addSpecies(sp));
   wireVoiceLogging($("#voiceLogBtn"), $("#voiceLogStatus"), "releve", (sp, opts) => ReleveEditor.addSpecies(sp, opts));
   $("#coverScaleSelect").addEventListener("change", () => {
     ReleveEditor.current.coverScale = $("#coverScaleSelect").value;
     ReleveEditor.renderSpecies();
   });
+  $("#releveSortSelect").addEventListener("change", () => ReleveEditor.renderSpecies());
   $("#relevePhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, ReleveEditor.current.photoIds, $("#relevePhotos")));
   $("#releveSaveBtn").addEventListener("click", () => ReleveEditor.save());
+  $("#releveDuplicateBtn").addEventListener("click", () => ReleveEditor.duplicate());
   $("#releveDeleteBtn").addEventListener("click", () => ReleveEditor.remove());
+
+  ReleveEditor._gpsSeNested = wireGpsButton($("#nestedSeGpsBtn"), $("#nestedSeGpsStatus"), $("#nestedSeLat"), $("#nestedSeLon"), $("#nestedSeAlt"), $("#nestedSeAcc"), "releve");
+  wireLiveMapUpdates($("#nestedSeLat"), $("#nestedSeLon"), () => ReleveEditor._mapSe, $("#nestedSeAcc"));
+
+  $("#nestedEnableBox").addEventListener("change", () => {
+    ReleveEditor.current.nestedEnabled = $("#nestedEnableBox").checked;
+    ReleveEditor.renderNested();
+    ReleveEditor.renderSpecies();
+  });
+  $all('input[name="nestingType"]').forEach(el => el.addEventListener("change", () => {
+    if (!el.checked) return;
+    ReleveEditor.current.nestingType = el.value;
+    ReleveEditor.renderNested();
+    ReleveEditor.renderSpecies();
+  }));
+  $all('input[name="progressionPreset"]').forEach(el => el.addEventListener("change", () => {
+    if (!el.checked) return;
+    ReleveEditor.current.progressionPreset = el.value;
+    ReleveEditor.renderNested();
+    ReleveEditor.renderSpecies();
+  }));
+  $("#customProgressionInput").addEventListener("change", () => {
+    ReleveEditor.current.customProgression = $("#customProgressionInput").value;
+    ReleveEditor.renderNested();
+    ReleveEditor.renderSpecies();
+  });
 }
 
 function wireObservationEditor() {
-  wireGpsButton($("#observationGpsBtn"), $("#observationGpsStatus"), $("#observationLat"), $("#observationLon"), null, null);
+  ObservationEditor._gps = wireGpsButton($("#observationGpsBtn"), $("#observationGpsStatus"), $("#observationLat"), $("#observationLon"), null, null, "observation");
+  wireLiveMapUpdates($("#observationLat"), $("#observationLon"), () => ObservationEditor._map);
   wireAutocomplete($("#observationTaxonInput"), $("#observationAcMenu"), sp => ObservationEditor.setTaxon(sp));
   wireDictation($("#observationDictateBtn"), $("#observationTaxonInput"), $("#observationAcMenu"), $("#observationDictateStatus"), sp => ObservationEditor.setTaxon(sp));
   $("#observationPhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, ObservationEditor.current.photoIds, $("#observationPhotos")));
   $("#observationSaveBtn").addEventListener("click", () => ObservationEditor.save());
   $("#observationDeleteBtn").addEventListener("click", () => ObservationEditor.remove());
+}
+
+function wireEdggEditor() {
+  EdggEditor._gpsNw = wireGpsButton($("#edggNwGpsBtn"), $("#edggNwGpsStatus"), $("#edggNwLat"), $("#edggNwLon"), $("#edggNwAlt"), $("#edggNwAcc"), "edgg");
+  EdggEditor._gpsSe = wireGpsButton($("#edggSeGpsBtn"), $("#edggSeGpsStatus"), $("#edggSeLat"), $("#edggSeLon"), $("#edggSeAlt"), $("#edggSeAcc"), "edgg");
+  wireLiveMapUpdates($("#edggNwLat"), $("#edggNwLon"), () => EdggEditor._mapNw, $("#edggNwAcc"));
+  wireLiveMapUpdates($("#edggSeLat"), $("#edggSeLon"), () => EdggEditor._mapSe, $("#edggSeAcc"));
+
+  wireAutocomplete($("#edggNwSearchInput"), $("#edggNwAcMenu"), sp => EdggEditor.addSpecies("nw", sp));
+  wireAutocomplete($("#edggSeSearchInput"), $("#edggSeAcMenu"), sp => EdggEditor.addSpecies("se", sp));
+  wireVoiceLogging($("#edggNwVoiceLogBtn"), $("#edggNwVoiceLogStatus"), "edgg", (sp, opts) => EdggEditor.addSpecies("nw", sp, opts));
+  wireVoiceLogging($("#edggSeVoiceLogBtn"), $("#edggSeVoiceLogStatus"), "edgg", (sp, opts) => EdggEditor.addSpecies("se", sp, opts));
+  $("#edggNwSortSelect").addEventListener("change", () => EdggEditor.renderSpecies("nw"));
+  $("#edggSeSortSelect").addEventListener("change", () => EdggEditor.renderSpecies("se"));
+
+  wireAutocomplete($("#edggCover100SearchInput"), $("#edggCover100AcMenu"), sp => EdggEditor.addCoverEntry("cover100", sp));
+  wireAutocomplete($("#edggCover1000SearchInput"), $("#edggCover1000AcMenu"), sp => EdggEditor.addCoverEntry("cover1000", sp));
+
+  $("#edgg1000Toggle").addEventListener("change", () => {
+    EdggEditor.current.include1000 = $("#edgg1000Toggle").checked;
+    $("#edgg1000Instructions").hidden = !EdggEditor.current.include1000;
+    $("#edggCover1000Section").hidden = !EdggEditor.current.include1000;
+    $("#edggDiagram").innerHTML = edggDiagramSvg(EdggEditor.current.include1000);
+  });
+
+  $("#edggBiomassEnable").addEventListener("change", () => {
+    $("#edggBiomassFields").hidden = !$("#edggBiomassEnable").checked;
+  });
+  $("#edggBiomassCorner").addEventListener("change", () => {
+    const v = $("#edggBiomassCorner").value;
+    $("#edggBiomassNw").hidden = v === "se";
+    $("#edggBiomassSe").hidden = v === "nw";
+  });
+
+  $("#edggPhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, EdggEditor.current.photoIds, $("#edggPhotos")));
+  $("#edggSaveBtn").addEventListener("click", () => EdggEditor.save());
+  $("#edggDuplicateBtn").addEventListener("click", () => EdggEditor.duplicate());
+  $("#edggDeleteBtn").addEventListener("click", () => EdggEditor.remove());
 }
 
 function wireRecords() {
@@ -1696,6 +2965,13 @@ function wireSettings() {
     $("#voiceReviewCheckpointInput").value = s.voiceReviewCheckpoint;
     await Store.saveSettings(s);
   });
+  $("#aiVoiceEnabled").addEventListener("change", async () => {
+    const s = await Store.getSettings();
+    s.aiVoiceEnabled = $("#aiVoiceEnabled").checked;
+    await Store.saveSettings(s);
+    await AiVoice.refreshStatus();
+  });
+  $("#aiVoiceDownloadBtn").addEventListener("click", () => AiVoice.ensureLoaded());
   $("#exportCsvBtn").addEventListener("click", () => exportCsv());
   $("#exportJsonBtn").addEventListener("click", () => exportJson());
   $("#importJsonInput").addEventListener("change", async e => {
@@ -1727,7 +3003,7 @@ function wireNetStatus() {
 }
 
 async function init() {
-  wireNav(); wireHome(); wireReleveEditor(); wireObservationEditor(); wireTransectEditor(); wireTransectReview(); wireRecords(); wireSettings(); wireNetStatus();
+  wireNav(); wireHome(); wireInfoModal(); wireReleveEditor(); wireObservationEditor(); wireTransectEditor(); wireTransectReview(); wireEdggEditor(); wireRecords(); wireSettings(); wireNetStatus();
   showView("home");
   try {
     await Species.loadAll();
@@ -1736,6 +3012,11 @@ async function init() {
     console.error(e);
   }
   await Home.refresh();
+  // If AI-enhanced voice matching was already enabled in a previous session,
+  // start warming it up now (from browser cache — no re-download) instead of
+  // only on the next Settings visit, so it's ready by the time it's needed.
+  const settings = await Store.getSettings();
+  if (settings.aiVoiceEnabled) AiVoice.ensureLoaded();
 }
 
 document.addEventListener("DOMContentLoaded", init);

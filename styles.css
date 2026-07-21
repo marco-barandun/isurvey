@@ -141,6 +141,7 @@ textarea.input { resize: vertical; }
 
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 8px 0; }
 .settings-grid-4 { grid-template-columns: repeat(4, 1fr); }
+.settings-grid-5 { grid-template-columns: repeat(5, 1fr); gap: 6px; }
 .settings-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
 
 .segmented { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -151,6 +152,48 @@ textarea.input { resize: vertical; }
   border: 1px solid var(--hair-strong); font-size: 13px; cursor: pointer; user-select: none;
 }
 .seg input:checked + span { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); font-weight: 700; }
+
+/* ============================ info modal ============================ */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(10, 16, 12, 0.5); z-index: 200;
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.modal-backdrop[hidden] { display: none; }
+.modal-card {
+  background: var(--surface); width: 100%; max-width: 480px; max-height: 82vh;
+  border-radius: var(--r-lg) var(--r-lg) 0 0; overflow-y: auto; box-shadow: var(--shadow-sm);
+}
+@media (min-width: 640px) {
+  .modal-backdrop { align-items: center; padding: 20px; }
+  .modal-card { border-radius: var(--r-lg); max-height: 80vh; }
+}
+.modal-head {
+  position: sticky; top: 0; background: var(--surface); display: flex; align-items: center;
+  justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--hair); z-index: 1;
+}
+.modal-head h3 { margin: 0; font-size: 15px; }
+.modal-body { padding: 4px 16px 22px; font-size: 13.5px; line-height: 1.5; }
+.modal-body p { margin: 8px 0; }
+.method-stats { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12.5px; }
+.method-stats th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 10px 4px 0; white-space: nowrap; vertical-align: top; }
+.method-stats td { padding: 4px 0; }
+
+/* ============================ method picker ============================ */
+.method-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 10px 0 4px; }
+.method-card {
+  position: relative; padding: 10px 8px 8px; border-radius: var(--r-md); border: 1px solid var(--hair-strong);
+  background: var(--surface); cursor: pointer; text-align: center;
+}
+.method-card:active { transform: scale(0.98); }
+.method-card.selected { border-color: var(--accent-line); background: var(--accent-soft); }
+.method-card .method-label { display: block; font-size: 11.5px; font-weight: 600; margin-top: 2px; line-height: 1.25; }
+.method-info-btn {
+  position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%;
+  border: 1px solid var(--hair-strong); background: var(--surface); color: var(--muted);
+  font-size: 11px; font-weight: 700; font-style: italic; font-family: Georgia, serif; line-height: 1;
+  display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0;
+}
+.method-info-btn:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-line); }
 
 /* ============================ app / views ============================ */
 .app { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 12px); min-height: calc(100vh - var(--bar-h)); }
@@ -267,7 +310,19 @@ textarea.input { resize: vertical; }
 .ac-item:hover, .ac-item.hi { background: var(--accent-soft); }
 .ac-item .fam { color: var(--muted); font-size: 12px; }
 .ac-item .native-tag { font-size: 10px; color: var(--faint); }
+.native-tag { font-size: 10.5px; color: var(--faint); }
+.cf-prefix { color: var(--muted); font-style: italic; font-weight: 600; }
+.cf-toggle {
+  font-size: 11px; font-weight: 700; border: 1px solid var(--hair-strong); background: var(--surface);
+  color: var(--muted); border-radius: 999px; padding: 3px 8px; cursor: pointer; flex: none;
+}
+.cf-toggle.active { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); }
+.sp-freetext-tag {
+  display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em;
+  color: var(--muted); background: var(--hair); border-radius: 999px; padding: 1px 7px; margin-left: 4px; vertical-align: middle;
+}
 .ac-empty { padding: 10px 12px; color: var(--faint); font-size: 13px; }
+.ac-freetext .sp-name { color: var(--muted); font-style: normal; }
 
 .species-table { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .species-row {
@@ -276,11 +331,24 @@ textarea.input { resize: vertical; }
   padding: 8px 10px;
 }
 .species-row .sp-info { flex: 1; min-width: 0; }
-.species-row .sp-name { font-weight: 600; font-size: 13.5px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.species-row .sp-name { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .species-row .sp-fam { font-size: 11px; color: var(--muted); }
 .species-row select.input, .species-row input.input { width: auto; min-width: 64px; padding: 6px 8px; font-size: 13px; }
 .species-row .rm-btn { background: none; border: none; color: var(--faint); cursor: pointer; padding: 4px; flex: none; }
 .species-row .rm-btn:hover { color: var(--danger); }
+.sp-name-btn {
+  background: none; border: none; padding: 0; margin: 0; text-align: left;
+  font: inherit; font-style: italic; font-weight: 600; color: var(--ink); cursor: pointer;
+  text-decoration: underline dotted var(--faint); text-underline-offset: 2px;
+}
+.sp-name-btn:hover, .chip-name-btn:hover { color: var(--accent-strong); }
+
+.corrector-box {
+  margin-top: 10px; padding: 12px; border-radius: var(--r-md);
+  background: var(--accent-soft); border: 1px solid var(--accent-line);
+}
+.corrector-box .btn-area { margin: 6px 0; }
+.corrector-sugg { display: flex; align-items: baseline; gap: 6px; }
 
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 .chip {
@@ -289,6 +357,7 @@ textarea.input { resize: vertical; }
   padding: 5px 10px 5px 12px; font-size: 13px; font-weight: 600;
 }
 .chip button { background: none; border: none; color: inherit; cursor: pointer; padding: 0; display: flex; }
+.chip-name-btn { font-style: italic; text-decoration: underline dotted; text-underline-offset: 2px; }
 
 .photo-row { margin-top: 4px; }
 .photo-add-btn { cursor: pointer; }
@@ -301,6 +370,29 @@ textarea.input { resize: vertical; }
 .tx-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--hair); border-radius: var(--r-sm); }
 .tx-item .name { font-weight: 600; font-size: 13.5px; flex: 1; }
 .tx-item .count { font-size: 12px; color: var(--muted); }
+
+.map-wrap { margin-top: 10px; }
+.map-embed {
+  height: 220px; border-radius: var(--r-md); overflow: hidden;
+  border: 1px solid var(--hair); background: var(--ground);
+}
+.map-wrap .hint { margin: 6px 0 0; }
+.leaflet-control-layers { font-family: var(--ui); font-size: 13px; }
+.map-acc-label {
+  background: rgba(255,255,255,.92); color: #1a201c; font-size: 11px; font-weight: 700;
+  padding: 3px 8px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.3); white-space: nowrap;
+}
+.map-acc-label:empty { display: none; }
+/* Leaflet's default toggle icon is a PNG asset we don't vendor (we use
+   L.circleMarker, not L.marker, so the marker-icon PNGs are unused —
+   but the layers control needs something). Inline SVG instead. */
+.leaflet-control-layers-toggle {
+  width: 32px !important; height: 32px !important;
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5z" fill="none" stroke="%23333" stroke-width="1.7" stroke-linejoin="round"/><path d="M3 12l9 5 9-5" fill="none" stroke="%23333" stroke-width="1.7" stroke-linejoin="round"/><path d="M3 16l9 5 9-5" fill="none" stroke="%23333" stroke-width="1.7" stroke-linejoin="round"/></svg>') !important;
+  background-size: 20px 20px !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+}
 
 .privacy-banner {
   display: flex; gap: 10px; align-items: flex-start;

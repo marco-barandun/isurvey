@@ -1,0 +1,308 @@
+// =============================================================================
+// whisper.js — experimental on-device audio-conditioned species matching
+//
+// Bypasses the Web Speech API entirely: records raw microphone audio, runs it
+// through an on-device Whisper model (transformers.js, vendored — no CDN),
+// and instead of trusting Whisper's free-form transcript at face value, scores
+// the AUDIO directly against every plausible candidate taxon name via
+// teacher-forced decoding — "how well does this recording match THIS exact
+// string" for each candidate, not "what did the model guess, then how close
+// is that guess (as text) to a real name."
+//
+// This is a separate ES module (transformers.js is ESM-only) that exposes a
+// small API on window.WhisperVoice for the classic-script app.js to call.
+// Loaded lazily — nothing here downloads or runs until the user opts in via
+// Settings, since the model is a real download (tens of MB) fetched from
+// Hugging Face's CDN on first use, then cached by the browser for offline
+// reuse afterward (same "needs network once" carve-out as the existing
+// Web Speech API voice features — see README).
+// =============================================================================
+
+import {
+  env, AutoProcessor, AutoTokenizer, WhisperForConditionalGeneration, Tensor,
+} from "./vendor/transformers.min.js";
+
+env.allowLocalModels = false;
+env.useBrowserCache = true;
+
+const MODEL_ID = "Xenova/whisper-tiny";
+
+// Dictation language for both the free transcript and every candidate score
+// — fixed rather than auto-detected. Whisper's own language auto-detection
+// needs its own extra forward pass, and more importantly the SAME language
+// must be used for the free transcript and every candidate's teacher-forced
+// score for their log-likelihoods to be comparable. English is a reasonable
+// default for Latin binomial dictation; could become a Settings option later.
+const LANG = "en";
+
+const state = {
+  loaded: false,
+  loading: null,
+  tokenizer: null,
+  processor: null,
+  model: null,
+  promptIds: null, // [<|startoftranscript|>, <|LANG|>, <|transcribe|>, <|notimestamps|>]
+};
+
+async function loadModel(onProgress) {
+  if (state.loaded) return;
+  if (state.loading) return state.loading;
+  state.loading = (async () => {
+    const opts = { progress_callback: onProgress };
+    state.tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, opts);
+    state.processor = await AutoProcessor.from_pretrained(MODEL_ID, opts);
+    // Pinned to transformers.js 3.1.0 specifically because it's the one
+    // release pinning a stable (non-nightly) onnxruntime-web — every other
+    // release (including all of 4.x) bundles an ORT dev build, and 1.25+
+    // has a real regression (microsoft/onnxruntime#28306) that fails to
+    // create a session for Whisper's merged decoder graph at all, quantized
+    // or not. "quantized: true" is this older version's loading option.
+    state.model = await WhisperForConditionalGeneration.from_pretrained(MODEL_ID, { ...opts, quantized: true });
+    const tok = s => state.tokenizer.model.tokens_to_ids.get(s);
+    state.promptIds = [tok("<|startoftranscript|>"), tok(`<|${LANG}|>`), tok("<|transcribe|>"), tok("<|notimestamps|>")];
+    state.loaded = true;
+  })();
+  try {
+    await state.loading;
+  } finally {
+    state.loading = null;
+  }
+}
+
+function isSupported() {
+  return !!(window.WebAssembly && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+}
+
+// ---- microphone capture: record to a Blob, decode + resample to 16kHz mono
+// Float32Array PCM (what Whisper's feature extractor expects). MediaRecorder
+// + decodeAudioData is used instead of ScriptProcessorNode/AudioWorklet — far
+// less code, no feedback-loop footguns, and resampling is needed regardless
+// of capture method since mic hardware is essentially never natively 16kHz.
+
+let activeStream = null, activeRecorder = null;
+
+async function startRecording() {
+  activeStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+  const chunks = [];
+  activeRecorder = new MediaRecorder(activeStream);
+  activeRecorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  const stopped = new Promise((resolve, reject) => {
+    activeRecorder.onstop = () => resolve(new Blob(chunks, { type: activeRecorder.mimeType }));
+    activeRecorder.onerror = reject;
+  });
+  activeRecorder.start();
+  return stopped;
+}
+
+function stopRecording() {
+  if (activeRecorder && activeRecorder.state !== "inactive") activeRecorder.stop();
+  if (activeStream) activeStream.getTracks().forEach(t => t.stop());
+}
+
+async function blobToPCM16k(blob) {
+  const arrayBuf = await blob.arrayBuffer();
+  const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+  let decoded;
+  try {
+    decoded = await tempCtx.decodeAudioData(arrayBuf);
+  } finally {
+    tempCtx.close();
+  }
+  const targetLen = Math.max(1, Math.ceil(decoded.duration * 16000));
+  const offline = new OfflineAudioContext(1, targetLen, 16000);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0);
+}
+
+// ---- continuous hands-free capture (voice activity detection) ------------
+// Whisper has no built-in equivalent of the Web Speech API's continuous
+// mode with auto-endpointing, so this builds the same idea directly: keep
+// one mic stream open, watch its volume via an AnalyserNode, and treat a
+// sustained rise as the start of an utterance and a sustained drop as its
+// end — each utterance becomes its own MediaRecorder-captured Blob, handed
+// to the caller one at a time. This naturally splits "species said one at a
+// time while walking" the same way a pause between words splits Web Speech
+// API results; it does NOT split two names said back-to-back with too
+// short a pause (no equivalent of the text-based DP segmenter used for
+// that case in the Web Speech path) — a known, accepted gap for now.
+const VAD_THRESHOLD = 0.02;     // RMS amplitude (0–1) treated as "speaking"
+const VAD_SILENCE_MS = 600;     // sustained silence to end an utterance
+const VAD_MIN_SPEECH_MS = 200;  // shorter blips are discarded as noise
+const VAD_MAX_SPEECH_MS = 8000; // force-cut a runaway segment (e.g. wind noise)
+const VAD_POLL_MS = 100;
+
+async function startContinuousCapture(onSegment) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AC();
+  const source = audioCtx.createMediaStreamSource(stream);
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  source.connect(analyser);
+  const timeData = new Uint8Array(analyser.fftSize);
+
+  let recorder = null, chunks = [], speaking = false, speechStartAt = 0, silenceStartAt = 0;
+
+  function rmsLevel() {
+    analyser.getByteTimeDomainData(timeData);
+    let sumSq = 0;
+    for (let i = 0; i < timeData.length; i++) { const v = (timeData[i] - 128) / 128; sumSq += v * v; }
+    return Math.sqrt(sumSq / timeData.length);
+  }
+
+  function beginSegment() {
+    chunks = [];
+    recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recorder.start();
+    speaking = true;
+    speechStartAt = Date.now();
+    silenceStartAt = 0;
+  }
+  function endSegment() {
+    if (!recorder) return;
+    const rec = recorder, startedAt = speechStartAt;
+    recorder = null;
+    speaking = false;
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type: rec.mimeType });
+      if (blob.size && Date.now() - startedAt >= VAD_MIN_SPEECH_MS) onSegment(blob);
+    };
+    try { rec.stop(); } catch { /* already inactive */ }
+  }
+
+  const intervalId = setInterval(() => {
+    const level = rmsLevel(), now = Date.now();
+    if (level > VAD_THRESHOLD) {
+      silenceStartAt = 0;
+      if (!speaking) beginSegment();
+      else if (now - speechStartAt > VAD_MAX_SPEECH_MS) endSegment();
+    } else if (speaking) {
+      if (!silenceStartAt) silenceStartAt = now;
+      else if (now - silenceStartAt >= VAD_SILENCE_MS) endSegment();
+    }
+  }, VAD_POLL_MS);
+
+  return function stopContinuousCapture() {
+    clearInterval(intervalId);
+    if (recorder && recorder.state !== "inactive") { try { recorder.stop(); } catch { /* ignore */ } }
+    stream.getTracks().forEach(t => t.stop());
+    audioCtx.close();
+  };
+}
+
+// ---- transcription + closed-set audio rescoring --------------------------
+//
+// The high-level model.forward()/generate() wrapper in this library version
+// mishandles direct (non-generate) calls on Whisper's merged encoder-decoder
+// graph (an input-name mismatch bug independent of the ONNX Runtime version
+// issue worked around above). Teacher-forced scoring therefore calls the two
+// underlying ONNX Runtime sessions directly — model.sessions.model (encoder)
+// and model.sessions.decoder_model_merged (decoder) — which is the one path
+// verified to work correctly end-to-end.
+
+const N_LAYERS = 4, N_HEADS = 6, HEAD_DIM = 64; // whisper-tiny architecture
+
+async function runEncoder(inputFeatures) {
+  const out = await state.model.sessions.model.run({ input_features: inputFeatures });
+  return out.last_hidden_state;
+}
+
+async function freeTranscript(inputFeatures) {
+  const out = await state.model.generate({ input_features: inputFeatures, language: LANG, task: "transcribe", max_new_tokens: 64 });
+  const text = state.tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || "";
+  return text.trim();
+}
+
+// One decoder forward pass over prompt + candidate + <|endoftext|>, teacher-
+// forced (the whole sequence is given up front, not generated token by
+// token) — reuses the same encoder_hidden_states across every candidate for
+// one utterance, so only this (cheap, short-sequence) call repeats per
+// candidate, not the (expensive, fixed-length) encoder pass.
+function decoderInputsFor(seq, encoderHidden) {
+  const inputs = {
+    input_ids: new Tensor("int64", BigInt64Array.from(seq.map(BigInt)), [1, seq.length]),
+    encoder_hidden_states: encoderHidden,
+    use_cache_branch: new Tensor("bool", [false], [1]),
+  };
+  // The merged decoder graph declares KV-cache inputs unconditionally (an
+  // "If" node branches on use_cache_branch at runtime) — ORT still requires
+  // every declared input to be supplied, so these are zero-length placeholders
+  // for the not-taken "with cache" branch, not real cached state.
+  for (let i = 0; i < N_LAYERS; i++) {
+    for (const who of ["decoder", "encoder"]) {
+      for (const kv of ["key", "value"]) {
+        inputs[`past_key_values.${i}.${who}.${kv}`] = new Tensor("float32", new Float32Array(0), [1, N_HEADS, 0, HEAD_DIM]);
+      }
+    }
+  }
+  return inputs;
+}
+
+// Teacher-forced length-normalized log-likelihood of one candidate string
+// given the audio — "how well does this recording match exactly this name,"
+// scored directly from the acoustic model rather than from text similarity.
+async function scoreCandidate(encoderHidden, candidateText) {
+  const eot = state.tokenizer.model.tokens_to_ids.get("<|endoftext|>");
+  const candidateIds = state.tokenizer.encode(candidateText, { add_special_tokens: false });
+  const targets = [...candidateIds, eot];
+  const seq = [...state.promptIds, ...targets];
+
+  const { logits } = await state.model.sessions.decoder_model_merged.run(decoderInputsFor(seq, encoderHidden));
+  const data = logits.data, vocab = logits.dims[logits.dims.length - 1];
+  const startAt = state.promptIds.length - 1; // position predicting the first real token
+  let logProb = 0;
+  for (let k = 0; k < targets.length; k++) {
+    const row = data.subarray((startAt + k) * vocab, (startAt + k + 1) * vocab);
+    let max = -Infinity;
+    for (let v = 0; v < vocab; v++) if (row[v] > max) max = row[v];
+    let sumExp = 0;
+    for (let v = 0; v < vocab; v++) sumExp += Math.exp(row[v] - max);
+    logProb += (row[targets[k]] - max) - Math.log(sumExp);
+  }
+  return logProb / targets.length;
+}
+
+// Step 1: transcribe one utterance freely, and hand back a handle (the
+// encoder's hidden states) the caller passes into rescore() below — this
+// split lets the caller build its candidate shortlist FROM the transcript
+// (via the existing text fuzzy-matcher) before audio-rescoring against it,
+// without recomputing the (expensive, fixed-cost) encoder pass a second time.
+async function transcribeAudio(pcm16k) {
+  // The feature-extraction session (mel-spectrogram) and the encoder/decoder
+  // sessions aren't safe to run concurrently against each other (ORT session
+  // reentrancy) — processed once, then the two model passes run in sequence.
+  const { input_features } = await state.processor(pcm16k);
+  const encoderHidden = await runEncoder(input_features);
+  const transcript = await freeTranscript(input_features);
+  return { transcript, encoderHandle: encoderHidden };
+}
+
+// Step 2: rescore a shortlist of candidate taxon names against the audio
+// behind the given encoderHandle (from transcribeAudio above). Returns the
+// candidates ranked by audio-conditioned score (higher = better match).
+async function rescoreCandidates(encoderHandle, candidateTexts) {
+  const ranked = [];
+  for (const text of candidateTexts) {
+    const score = await scoreCandidate(encoderHandle, text);
+    ranked.push({ text, score });
+  }
+  ranked.sort((a, b) => b.score - a.score);
+  return ranked;
+}
+
+window.WhisperVoice = {
+  isSupported,
+  isLoaded: () => state.loaded,
+  loadModel,
+  startRecording,
+  stopRecording,
+  blobToPCM16k,
+  transcribeAudio,
+  rescoreCandidates,
+  startContinuousCapture,
+};

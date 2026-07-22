@@ -672,6 +672,97 @@ const ContextPriors = {
   },
 };
 
+/* ============================================================
+   TypoCH — Swiss habitat typology (Delarze, Gonseth, Eggenberg & Vust 2015,
+   "Lebensräume der Schweiz"). Bundled from InfoFlora's TypoCH species-list
+   export (species/typoch-ch.json): the habitat hierarchy plus, for each
+   species, the habitats it is a character species of. Powers "habitat
+   analysis from a species list" — rank the habitats whose character species
+   are present in a relevé. Only loaded/offered when the Swiss checklist is
+   active. See scripts/build_typoch.py.
+   ============================================================ */
+const TypoCH = {
+  habitats: null, byId: null, byKey: null, loaded: false, loading: null,
+
+  async load() {
+    if (this.loaded || this.loading) return this.loading;
+    this.loading = (async () => {
+      try {
+        const r = await fetch("species/typoch-ch.json");
+        const d = await r.json();
+        this.habitats = d.habitats;
+        this.byId = {};
+        for (const h of d.habitats) this.byId[h.id] = h;
+        // Index associations by species-key (genus+epithet) so a relevé's
+        // subspecies/aggregate still finds its species' habitats.
+        this.byKey = {};
+        for (const name in d.species) {
+          const k = speciesKey(name);
+          if (!this.byKey[k]) this.byKey[k] = d.species[name];
+        }
+        this.loaded = true;
+      } catch { this.habitats = null; }
+    })();
+    try { await this.loading; } finally { this.loading = null; }
+  },
+  available() { return this.loaded && !!this.habitats; },
+  name(h) {
+    if (!h) return "";
+    const l = (navigator.language || "").slice(0, 2);
+    return h[l] || h.de || h.fr || h.it || h.id;
+  },
+
+  // Rank habitats by the official TypoCH "Lebensraumanalyse" score. Each
+  // recorded character species contributes to every habitat it characterises:
+  //
+  //   ScoreLE = ΣK + 2·Σdom_K + 4·ΣC + 8·Σdom_C
+  //
+  // where K = ordinary character species (weight 1), C = characteristic
+  // species (weight 4, italic/"Charakterart" in Delarze et al. 2015), and the
+  // weight is doubled for a taxon that is BOTH recorded co-dominant in the plot
+  // (cover ≥ threshold) AND expected co-dominant for that habitat (the `d`
+  // flag, bold in the reference work). Without cover data it reduces to the
+  // simple ΣK + 4·ΣC. Source: Documenta InfoFlora, "Anleitung für die
+  // TypoCH-Lebensraumanalyse mit Artenlisten" (2024), Abb. 7–8.
+  //
+  // `items` is the relevé's species array ({taxon, cover}); a plain array of
+  // name strings also works (treated as no cover, so no doubling).
+  analyze(items, limit, coverScale) {
+    if (!this.available()) return [];
+    const score = new Map(), support = new Map();
+    for (const it of items || []) {
+      const name = typeof it === "string" ? it : it.taxon;
+      const assocs = this.byKey[speciesKey(name)];
+      if (!assocs) continue;
+      const codom = typeof it === "string" ? false : isCoDominant(it.cover, coverScale);
+      for (const e of assocs) {
+        let w = e.c ? 4 : 1;
+        const doubled = codom && !!e.d;
+        if (doubled) w *= 2;
+        score.set(e.id, (score.get(e.id) || 0) + w);
+        if (!support.has(e.id)) support.set(e.id, []);
+        support.get(e.id).push({ taxon: name, c: !!e.c, doubled });
+      }
+    }
+    return [...score.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit || 6)
+      .map(([id, s]) => ({ hab: this.byId[id], score: s, support: support.get(id) }))
+      .filter(x => x.hab);
+  },
+};
+
+// TypoCH treats a taxon as co-dominant when its recorded cover reaches the
+// threshold: Braun-Blanquet class ≥ 2 (values 2/2m/2a/2b/3/4/5), or > 10 % for
+// percentage cover (the guide's rule of thumb). Below that, no dominance bonus.
+function isCoDominant(cover, scale) {
+  const v = (cover == null ? "" : String(cover)).trim();
+  if (!v) return false;
+  if (scale === "pct") { const n = parseFloat(v); return isFinite(n) && n > 10; }
+  const d = parseInt(v[0], 10); // "2m"/"2a"/"2b" → 2; "+"/"r" → NaN
+  return isFinite(d) && d >= 2;
+}
+
 /* Latin/scientific-name-tuned phonetic code — not a strict Metaphone port,
    a consonant-skeleton reduction that is deliberately *accent-invariant*, so
    the same Latin word lands on the same code whether an English, Italian,
@@ -1545,6 +1636,34 @@ function wireInfoModal() {
    appears, and so the wording lives next to the code it describes. Small SVGs
    use currentColor so they follow the light/dark theme. */
 const INFO_TOPICS = {
+  typoch: {
+    title: "Habitat analysis (TypoCH)",
+    html: `
+      <p>Every habitat type in the Swiss typology (TypoCH — Delarze, Gonseth,
+      Eggenberg &amp; Vust 2015, <em>Lebensräume der Schweiz</em>) has a set of
+      <strong>character species</strong>. This does the reverse: from the species
+      you've recorded, it ranks the habitats whose character species are most
+      present — so the vegetation itself proposes the habitat.</p>
+      ${typochBarSvg()}
+      <p><strong>How the score is computed.</strong> This is the official
+      InfoFlora <em>Lebensraumanalyse</em> score. Each character species you
+      recorded adds points to every habitat it belongs to:</p>
+      ${typochScoreSvg()}
+      <p>An ordinary character species scores <strong>1</strong>; a
+      <em>characteristic</em> species (italic in the reference work — a stronger
+      indicator) scores <strong>4</strong>. If a species is recorded
+      <em>co-dominant</em> in your plot (cover ≥ Braun-Blanquet 2, or &gt; 10 %)
+      <em>and</em> the habitat expects it to be dominant, its points double
+      (1→2, 4→8). The habitat score is the sum over all your species:</p>
+      <p style="text-align:center"><code>Score = ΣK + 2·Σdom&#8202;K + 4·ΣC + 8·Σdom&#8202;C</code></p>
+      <p>Each suggestion shows this <strong>score</strong> and how many of your
+      species support it, with its TypoCH code, alliance and EUNIS crosswalk.
+      Tap one to assign it, or search the full typology by name/code.</p>
+      <p>It's a decision aid, not a verdict — the top hit for a good species list
+      is usually right, but confirm against the habitat on the ground.</p>
+      <p class="hint">Source: Documenta InfoFlora, <em>Anleitung für die
+      TypoCH-Lebensraumanalyse mit Artenlisten</em> (2024).</p>`,
+  },
   contextPriors: {
     title: "Likely-species priors",
     html: `
@@ -1556,6 +1675,7 @@ const INFO_TOPICS = {
       by <em>how close</em> its records are — likelihood falls off with
       distance, but far-away regional species are still included, just lower.
       Cached per area, so a place you've visited keeps working offline.</p>
+      ${priorDistanceSvg()}
       <p>• <strong>General commonness</strong> — a bundled fallback for when
       you're offline or a species isn't recorded nearby, so a spoken "Achillea"
       still leans to the common <em>A. millefolium</em> over rare congeners.</p>
@@ -1576,6 +1696,7 @@ const INFO_TOPICS = {
       epithet</strong> (e.g. "acris"). It's matched against <em>only</em> the
       species of that genus — a handful of names instead of thousands — so even
       a rough pronunciation lands on the right one.</p>
+      ${twoStepFunnelSvg()}
       <p>Great for long or unfamiliar names and for strong accents. Uses your
       chosen recognition language (Settings).</p>`,
   },
@@ -1619,6 +1740,10 @@ const INFO_TOPICS = {
       ${coverScaleSvg()}
       <p><strong>Braun-Blanquet extended</strong> — splits class 2 into <code>2m / 2a / 2b</code> for finer low-cover resolution.</p>
       <p><strong>Percentage cover</strong> — enter a direct 0–100 % estimate instead of a class. Best when you want continuous values for analysis.</p>`,
+  },
+  coverPctMode: {
+    title: "Percentage-cover interpretation",
+    html: coverPctModeInfoHtml(),
   },
   gps: {
     title: "GPS capture",
@@ -1667,6 +1792,75 @@ function gpsAccuracySvg() {
     <line x1="100" y1="60" x2="146" y2="60" stroke="currentColor" stroke-width="1" opacity="0.6"/>
     <text x="120" y="52" font-size="10" fill="currentColor" opacity="0.8">± accuracy</text>
     <text x="100" y="112" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.6">point is never more precise than the circle</text>
+  </svg>`;
+}
+function typochBarSvg() {
+  const bars = [["Mesobromion", 0.95, 7], ["Xerobromion", 0.55, 5], ["Arrhenatherion", 0.3, 3]];
+  const rowH = 26, w = 300, labelW = 96, barMax = 150, base = 8;
+  const rows = bars.map(([lbl, frac, n], i) => {
+    const y = base + i * rowH;
+    return `<text x="0" y="${y + 12}" font-size="11" fill="currentColor">${lbl}</text>
+      <rect x="${labelW}" y="${y + 3}" width="${(barMax * frac).toFixed(0)}" height="14" rx="3" fill="currentColor" opacity="${(0.35 + 0.5 * frac).toFixed(2)}"/>
+      <text x="${labelW + barMax * frac + 6}" y="${y + 14}" font-size="10" fill="currentColor" opacity="0.75">${n} sp.</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${base * 2 + bars.length * rowH}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">${rows}</svg>`;
+}
+// The four per-species weights of the official TypoCH score, as labelled chips.
+function typochScoreSvg() {
+  const cells = [
+    ["Character sp.", "1", 0.3], ["+ co-dominant", "2", 0.45],
+    ["Characteristic", "4", 0.62], ["+ co-dominant", "8", 0.85],
+  ];
+  const W = 300, cw = 68, gap = 8, y = 6, h = 46;
+  const cellsSvg = cells.map(([lbl, val, op], i) => {
+    const x = 4 + i * (cw + gap);
+    return `<rect x="${x}" y="${y}" width="${cw}" height="${h}" rx="6" fill="currentColor" opacity="${op}"/>
+      <text x="${x + cw / 2}" y="${y + 22}" font-size="18" font-weight="800" fill="currentColor" text-anchor="middle">${val}</text>
+      <text x="${x + cw / 2}" y="${y + 38}" font-size="8" fill="currentColor" text-anchor="middle" opacity="0.85">${lbl}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${h + 12}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">${cellsSvg}</svg>`;
+}
+// Likelihood falling off with distance from the survey point — the core idea
+// behind the geographic prior (near species weighted up, far ones kept but low).
+function priorDistanceSvg() {
+  const W = 300, H = 120, x0 = 30, x1 = 288, y0 = 12, yB = 92;
+  const pts = [];
+  for (let i = 0; i <= 40; i++) {
+    const t = i / 40;
+    const x = x0 + t * (x1 - x0);
+    const y = yB - (yB - y0) * Math.exp(-t * 3.2);
+    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  }
+  const rings = [[0.14, "near"], [0.42, "mid"], [0.8, "far"]].map(([t, lbl]) => {
+    const x = x0 + t * (x1 - x0);
+    const y = yB - (yB - y0) * Math.exp(-t * 3.2);
+    return `<line x1="${x.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x.toFixed(1)}" y2="${yB}" stroke="currentColor" stroke-width="0.7" stroke-dasharray="2 2" opacity="0.4"/>
+      <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6" fill="currentColor"/>
+      <text x="${x.toFixed(1)}" y="${yB + 12}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">${lbl}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">
+    <line x1="${x0}" y1="${y0}" x2="${x0}" y2="${yB}" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+    <line x1="${x0}" y1="${yB}" x2="${x1}" y2="${yB}" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+    <polyline points="${pts.join(" ")}" fill="none" stroke="currentColor" stroke-width="2"/>
+    ${rings}
+    <text x="${x0 - 6}" y="${y0 + 6}" font-size="9" fill="currentColor" text-anchor="end" opacity="0.7">high</text>
+    <text x="${x0 - 6}" y="${yB}" font-size="9" fill="currentColor" text-anchor="end" opacity="0.7">low</text>
+    <text x="6" y="${(y0 + yB) / 2}" font-size="9" fill="currentColor" opacity="0.7" transform="rotate(-90 10 ${(y0 + yB) / 2})">likelihood</text>
+    <text x="${(x0 + x1) / 2}" y="${H - 4}" font-size="9" fill="currentColor" text-anchor="middle" opacity="0.7">distance from your location →</text>
+  </svg>`;
+}
+// The two-step idea: matching an epithet against one genus is a tiny shortlist
+// versus the whole checklist.
+function twoStepFunnelSvg() {
+  const W = 300, rowH = 30;
+  const row = (y, frac, label, op) => {
+    const w = Math.max(10, (W - 120) * frac);
+    return `<rect x="8" y="${y}" width="${w.toFixed(0)}" height="20" rx="3" fill="currentColor" opacity="${op}"/>
+      <text x="${w + 16}" y="${y + 14}" font-size="11" fill="currentColor">${label}</text>`;
+  };
+  return `<svg viewBox="0 0 ${W} ${rowH * 2 + 8}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">
+    ${row(6, 1, "~4200 names (whole checklist)", 0.22)}
+    ${row(6 + rowH, 0.035, "~10 in one genus", 0.6)}
   </svg>`;
 }
 
@@ -1805,6 +1999,90 @@ function renderMethodPicker(hostId, selected, onPick) {
 }
 
 /* ============================================================
+   PERCENTAGE-COVER INTERPRETATION
+   When cover is recorded as a raw % rather than a class, three
+   conventions exist for how the per-species values relate to the
+   plot and to each other. They are NOT interchangeable, so the plot
+   must state which one was used. "independent" (overlap-allowed
+   absolute cover) is the phytosociological standard and the default.
+   ============================================================ */
+
+const COVER_PCT_MODES = [
+  { id: "independent", label: "Independent cover", tag: "overlap ok · Σ can exceed 100 %", recommended: true },
+  { id: "ground", label: "Projective ground cover", tag: "one layer · Σ ≤ 100 %" },
+  { id: "relative", label: "Relative share", tag: "normalised · Σ = 100 %" },
+];
+const COVER_PCT_MODE_IDS = COVER_PCT_MODES.map(m => m.id);
+
+function coverPctMode(r) {
+  return COVER_PCT_MODE_IDS.includes(r && r.coverPctMode) ? r.coverPctMode : "independent";
+}
+
+// Small theme-aware diagram illustrating each interpretation.
+function coverPctModeSvg(kind) {
+  const fx = 8, fw = 284;
+  const seg = (x, w, lbl, op, y = 8, h = 26) =>
+    `<rect x="${x.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="${h}" fill="currentColor" opacity="${op}"/>` +
+    (w > 16 ? `<text x="${(x + w / 2).toFixed(1)}" y="${y + h / 2 + 4}" font-size="11" font-weight="700" fill="currentColor" text-anchor="middle">${lbl}</text>` : "");
+  const frame = `<rect x="${fx}" y="8" width="${fw}" height="26" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.55"/>`;
+  const wrap = (h, inner) => `<svg viewBox="0 0 300 ${h}" style="width:100%;max-width:300px;height:auto;display:block;margin:6px auto">${inner}</svg>`;
+
+  if (kind === "relative") {
+    let x = fx, s = "";
+    for (const [lbl, pct, op] of [["A", 45, 0.5], ["B", 35, 0.33], ["C", 20, 0.18]]) { const w = fw * pct / 100; s += seg(x, w, lbl, op); x += w; }
+    return wrap(52, frame + s + `<text x="${fx}" y="49" font-size="10" fill="currentColor" opacity="0.75">Σ = 100 % — every value rescaled to fill the bar exactly</text>`);
+  }
+  if (kind === "ground") {
+    let x = fx, s = "";
+    for (const [lbl, pct, op] of [["A", 40, 0.5], ["B", 25, 0.33], ["C", 15, 0.18]]) { const w = fw * pct / 100; s += seg(x, w, lbl, op); x += w; }
+    const bw = fw * 20 / 100;
+    s += `<rect x="${x.toFixed(1)}" y="8" width="${bw.toFixed(1)}" height="26" fill="none" stroke="currentColor" stroke-width="0.8" stroke-dasharray="3 2" opacity="0.5"/><text x="${(x + bw / 2).toFixed(1)}" y="25" font-size="8" fill="currentColor" text-anchor="middle" opacity="0.6">bare</text>`;
+    return wrap(52, frame + s + `<text x="${fx}" y="49" font-size="10" fill="currentColor" opacity="0.75">Σ ≤ 100 % — one projected layer; the rest is bare ground</text>`);
+  }
+  // independent — three separate 0–100 bars, each judged alone; they overlap
+  let s = "", y = 6;
+  for (const [lbl, pct, op] of [["A", 60, 0.5], ["B", 50, 0.33], ["C", 30, 0.18]]) {
+    s += `<rect x="${fx}" y="${y}" width="${fw}" height="14" fill="currentColor" opacity="0.09"/>` +
+      `<rect x="${fx}" y="${y}" width="${(fw * pct / 100).toFixed(1)}" height="14" fill="currentColor" opacity="${op}"/>` +
+      `<text x="${fx + 5}" y="${y + 11}" font-size="10" font-weight="700" fill="currentColor">${lbl}</text>` +
+      `<text x="${fx + fw}" y="${y + 11}" font-size="9" fill="currentColor" text-anchor="end" opacity="0.8">${pct}%</text>`;
+    y += 20;
+  }
+  return wrap(y + 14, s + `<text x="${fx}" y="${y + 10}" font-size="10" fill="currentColor" opacity="0.75">Σ = 140 % — layers stack, so the total can pass 100 %</text>`);
+}
+
+function coverPctModeInfoHtml() {
+  return `
+    <p>When you record cover as a plain percentage, decide up front what those numbers mean together. The three conventions give different totals for the same plot, so mixing them makes relevés incomparable.</p>
+    <p><strong>Independent cover</strong> — each species is judged on its own as the share of the plot its foliage covers when projected down, 0–100 %. Because plants grow in layers, the values can add up to more than 100 %.</p>
+    ${coverPctModeSvg("independent")}
+    <p><strong>Projective ground cover</strong> — treat the vegetation as a single canopy projected onto the ground; species divide up the surface and the remainder is bare soil / litter / rock, so the total never exceeds 100 %.</p>
+    ${coverPctModeSvg("ground")}
+    <p><strong>Relative share</strong> — values are rescaled so the species always sum to exactly 100 %; each is a species' share of the total vegetation (a dominance / yield share) rather than its real ground cover.</p>
+    ${coverPctModeSvg("relative")}
+    <p><strong>Recommended: Independent cover.</strong> It's the Braun-Blanquet / phytosociological convention and the safest default: every species is estimated on its own (so one bad guess doesn't distort the rest), no field arithmetic is forced, and it preserves real structural information — a two-layer stand genuinely covering 140 % looks different from an open one summing to 60 %. You can always derive relative shares afterwards by normalising. Use <em>projective ground cover</em> only when gaps and bare ground are the point (e.g. erosion, grazing impact), and <em>relative share</em> only when you specifically need composition to sum to 100 %.</p>`;
+}
+
+// Live total of the numeric cover values + a mode-aware validation hint.
+function coverPctSummary(r) {
+  const vals = r.species.map(s => parseFloat(s.cover)).filter(v => isFinite(v));
+  const sum = vals.reduce((a, b) => a + b, 0);
+  const n = vals.length;
+  const mode = coverPctMode(r);
+  const sumTxt = `Σ = ${Number(sum.toFixed(sum % 1 ? 1 : 0))} %`;
+  if (!n) return { sum, n, mode, level: "muted", text: "Enter a % for each species to see the running total." };
+  if (mode === "relative") {
+    if (Math.abs(sum - 100) <= 1) return { sum, n, mode, level: "ok", text: `${sumTxt} · sums to 100 %` };
+    return { sum, n, mode, level: "warn", text: `${sumTxt} · should total 100 % — rescale the values` };
+  }
+  if (mode === "ground") {
+    if (sum > 100.5) return { sum, n, mode, level: "warn", text: `${sumTxt} · over 100 % — impossible for one projected layer` };
+    return { sum, n, mode, level: "ok", text: `${sumTxt} · ${Number((100 - sum).toFixed(sum % 1 ? 1 : 0))} % bare / unvegetated` };
+  }
+  return { sum, n, mode, level: "muted", text: `${sumTxt} · overlap allowed — a total above 100 % is fine` };
+}
+
+/* ============================================================
    NESTED SAMPLING (species-area design)
    Optional nested sub-plot mode for relevés: either concentric
    ("centre-out") or anchored at two opposite plot corners
@@ -1898,10 +2176,11 @@ const ReleveEditor = {
       lat: "", lon: "", alt: "", acc: "",
       area: "", slope: "", aspect: "", habitat: "",
       coverTree: "", coverShrub: "", coverHerb: "", coverMoss: "",
-      coverScale: "bb",
+      coverScale: "bb", coverPctMode: "independent",
       assessmentMethod: "visual",
       nestedEnabled: false, nestingType: "center", progressionPreset: "edgg", customProgression: "",
       seLat: "", seLon: "", seAlt: "", seAcc: "",
+      typoId: "", typoCode: "", typoName: "",
       species: [], photoIds: [], notes: "",
     };
   },
@@ -1950,10 +2229,87 @@ const ReleveEditor = {
     this._map = this._map || createLocationMap("releveMap", "releveMapWrap");
     this._map.update(r.lat, r.lon, r.acc);
     ContextPriors.setLocation(r.lat, r.lon);
+    this.renderCoverPctMode();
     this.renderAssessmentMethod();
     this.renderNested();
     this.renderSpecies();
+    this.renderHabitat();
     await renderPhotoGrid(r.photoIds, $("#relevePhotos"));
+  },
+
+  // Percentage-cover interpretation picker + live total. The sub-mode only
+  // matters when cover is recorded as a raw %, so the whole block hides for
+  // the Braun-Blanquet scales.
+  renderCoverPctMode() {
+    const r = this.current;
+    const isPct = r.coverScale === "pct";
+    const block = $("#coverPctModeBlock");
+    if (block) block.hidden = !isPct;
+    if (isPct) {
+      const mode = coverPctMode(r);
+      $all('input[name="coverPctMode"]').forEach(el => { el.checked = el.value === mode; });
+    }
+    this.renderCoverSummary();
+  },
+
+  renderCoverSummary() {
+    const r = this.current, el = $("#coverPctSummary");
+    if (!el) return;
+    if (r.coverScale !== "pct" || !r.species.length) { el.hidden = true; el.textContent = ""; return; }
+    const s = coverPctSummary(r);
+    el.hidden = false;
+    el.className = "cover-sum " + s.level;
+    el.textContent = s.text;
+  },
+
+  // TypoCH habitat analysis + selection (Switzerland only, when loaded).
+  renderHabitat() {
+    const fold = $("#releveHabitatFold");
+    if (!fold) return;
+    if (!TypoCH.available()) { fold.hidden = true; return; }
+    fold.hidden = false;
+    const r = this.current;
+
+    // Ranked suggestions from the recorded species, scored by the official
+    // TypoCH Lebensraumanalyse (cover-weighted when a % / BB value is present).
+    const ranked = TypoCH.analyze(r.species, 5, r.coverScale);
+    const host = $("#habitatSuggestions");
+    if (!ranked.length) {
+      host.innerHTML = `<div class="habitat-empty">Add a few species and the likely habitat types will appear here.</div>`;
+    } else {
+      const maxScore = ranked[0].score || 1;
+      host.innerHTML = `<div class="habitat-list">` + ranked.map(x => {
+        const sel = x.hab.id === r.typoId ? " selected" : "";
+        const barH = Math.max(0.25, x.score / maxScore);
+        const chars = x.support.filter(s => s.c).length;
+        const title = `Score ${x.score} · ${x.support.length} character species${chars ? ` (${chars} characteristic)` : ""}`;
+        return `<button type="button" class="habitat-card${sel}" data-id="${x.hab.id}">
+          <span class="h-bar" style="opacity:${(0.4 + 0.55 * barH).toFixed(2)}"></span>
+          <span class="h-main">
+            <span class="h-name">${esc(TypoCH.name(x.hab))}</span>
+            <span class="h-meta">${esc(x.hab.code)}${x.hab.sci ? " · " + esc(x.hab.sci) : ""}${x.hab.eunis ? " · EUNIS " + esc(x.hab.eunis.split(";")[0]) : ""}</span>
+          </span>
+          <span class="h-count" title="${esc(title)}"><span class="h-score">${x.score}</span><span class="h-sp">${x.support.length} sp.</span></span>
+        </button>`;
+      }).join("") + `</div>`;
+      $all(".habitat-card", host).forEach(btn => btn.addEventListener("click", () => this.selectHabitat(btn.dataset.id)));
+    }
+    this.renderHabitatSelected();
+  },
+  renderHabitatSelected() {
+    const el = $("#habitatSelected"), r = this.current;
+    if (r.typoId) {
+      el.innerHTML = `Assigned: <strong>${esc(r.typoName)}</strong> (${esc(r.typoCode)}) <button type="button" id="habitatClearBtn" class="link-btn" style="padding:0 4px">clear</button>`;
+      $("#habitatClearBtn").addEventListener("click", () => this.selectHabitat(null));
+    } else {
+      el.textContent = "";
+    }
+  },
+  selectHabitat(id) {
+    const r = this.current;
+    if (!id) { r.typoId = ""; r.typoCode = ""; r.typoName = ""; }
+    else { const h = TypoCH.byId[id]; if (!h) return; r.typoId = h.id; r.typoCode = h.code; r.typoName = TypoCH.name(h); }
+    this.renderHabitat();
   },
 
   renderAssessmentMethod() {
@@ -2031,6 +2387,10 @@ const ReleveEditor = {
       const cornerSel = $(".sp-corner", row);
       if (cornerSel) cornerSel.addEventListener("change", e => { r.species[i].corner = e.target.value; });
     });
+    // Habitat suggestions follow the species list as it changes.
+    if ($("#releveHabitatFold") && !$("#releveHabitatFold").hidden) this.renderHabitat();
+    // Keep the running % total in step with edited cover values.
+    this.renderCoverSummary();
   },
 
   replaceSpeciesAt(i, sp) {
@@ -2102,6 +2462,8 @@ const ReleveEditor = {
     const src = this.current;
     const copy = this.blank();
     copy.coverScale = src.coverScale;
+    copy.coverPctMode = src.coverPctMode;
+    copy.typoId = src.typoId; copy.typoCode = src.typoCode; copy.typoName = src.typoName;
     copy.assessmentMethod = src.assessmentMethod;
     copy.nestedEnabled = src.nestedEnabled;
     copy.nestingType = src.nestingType;
@@ -2946,6 +3308,10 @@ const EdggEditor = {
    RECORD LIST RENDERING (shared by Home + Records views)
    ============================================================ */
 
+// An EDGG plot is a relevé recorded with the EDGG protocol, so it groups,
+// counts and filters as a relevé throughout the app (its editor stays separate).
+function isReleveType(type) { return type === "releve" || type === "edgg"; }
+
 function recordIcon(type) {
   if (type === "releve") return `<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
   if (type === "transect") return `<svg viewBox="0 0 24 24"><path d="M3 18c4-8 6 6 10-2 2-4 4-4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="12.2" r="1.4" fill="currentColor"/><circle cx="13.3" cy="14.8" r="1.4" fill="currentColor"/><circle cx="19" cy="11.5" r="1.4" fill="currentColor"/></svg>`;
@@ -2967,7 +3333,7 @@ function recordSub(rec) {
     bits.push(`${rec.species.length} spp.${unreviewed ? `, ${unreviewed} to review` : ""}`);
   } else if (rec.type === "edgg") {
     const n = new Set([...rec.nwSpecies.map(s => s.taxon), ...rec.seSpecies.map(s => s.taxon)]).size;
-    bits.push(`${n} spp.`, rec.include1000 ? "100+1000 m²" : "100 m²");
+    bits.push("EDGG", `${n} spp.`, rec.include1000 ? "100+1000 m²" : "100 m²");
   } else if (rec.family) bits.push(rec.family);
   if ((rec.lat && rec.lon) || (rec.nwLat && rec.nwLon)) bits.push("GPS");
   return bits.filter(Boolean).join(" · ");
@@ -3007,7 +3373,8 @@ const Home = {
   async refresh() {
     const records = await Store.allRecords();
     records.sort((a, b) => b.updatedAt - a.updatedAt);
-    const releveCount = records.filter(r => r.type === "releve").length;
+    // EDGG plots are a kind of relevé, so they're counted as relevés.
+    const releveCount = records.filter(r => isReleveType(r.type)).length;
     const observationCount = records.filter(r => r.type === "observation").length;
     const transectCount = records.filter(r => r.type === "transect").length;
     const edggCount = records.filter(r => r.type === "edgg").length;
@@ -3019,10 +3386,9 @@ const Home = {
     });
 
     $("#homeStats").innerHTML = `
-      <div class="stat-card"><div class="n">${releveCount}</div><div class="l">Relevés</div></div>
+      <div class="stat-card"><div class="n">${releveCount}</div><div class="l">Relevés${edggCount ? ` <span class="stat-sub">${edggCount} EDGG</span>` : ""}</div></div>
       <div class="stat-card"><div class="n">${transectCount}</div><div class="l">Transects</div></div>
       <div class="stat-card"><div class="n">${observationCount}</div><div class="l">Observations</div></div>
-      <div class="stat-card"><div class="n">${edggCount}</div><div class="l">EDGG plots</div></div>
       <div class="stat-card"><div class="n">${speciesSet.size}</div><div class="l">Taxa recorded</div></div>
     `;
 
@@ -3042,7 +3408,9 @@ const Records = {
     const activeTypes = $all("#recordsFilter input:checked").map(i => i.value);
 
     const filtered = records.filter(r => {
-      if (!activeTypes.includes(r.type)) return false;
+      // EDGG plots are relevés, so the "Relevés" filter includes them.
+      const bucket = isReleveType(r.type) ? "releve" : r.type;
+      if (!activeTypes.includes(bucket)) return false;
       if (!q) return true;
       const hay = r.type === "releve"
         ? [r.name, r.habitat, ...r.species.map(s => s.taxon)].join(" ").toLowerCase()
@@ -3185,10 +3553,10 @@ async function exportCsv() {
   const observations = records.filter(r => r.type === "observation");
   const transects = records.filter(r => r.type === "transect");
 
-  const releveRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "area_m2", "slope_deg", "aspect", "habitat", "cover_tree_pct", "cover_shrub_pct", "cover_herb_pct", "cover_moss_pct", "cover_scale", "assessment_method", "nested_enabled", "nesting_type", "progression_preset", "area_progression_m2", "se_lat", "se_lon", "species_count", "notes"]];
+  const releveRows = [["id", "name", "date", "time", "lat", "lon", "alt", "accuracy_m", "area_m2", "slope_deg", "aspect", "habitat", "typoch_code", "typoch_id", "typoch_name", "cover_tree_pct", "cover_shrub_pct", "cover_herb_pct", "cover_moss_pct", "cover_scale", "cover_pct_mode", "assessment_method", "nested_enabled", "nesting_type", "progression_preset", "area_progression_m2", "se_lat", "se_lon", "species_count", "notes"]];
   const speciesRows = [["releve_id", "releve_name", "taxon", "family", "native", "cf", "not_in_checklist", "layer", "cover", "grain_m2", "corner", "logged_at"]];
   releves.forEach(r => {
-    releveRows.push([r.id, r.name, r.date, r.time, r.lat, r.lon, r.alt, r.acc, r.area, r.slope, r.aspect, r.habitat, r.coverTree, r.coverShrub, r.coverHerb, r.coverMoss, r.coverScale, r.assessmentMethod || "", r.nestedEnabled ? "yes" : "no", r.nestedEnabled ? r.nestingType : "", r.nestedEnabled ? r.progressionPreset : "", r.nestedEnabled ? activeProgression(r).join("/") : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLat : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLon : "", r.species.length, r.notes]);
+    releveRows.push([r.id, r.name, r.date, r.time, r.lat, r.lon, r.alt, r.acc, r.area, r.slope, r.aspect, r.habitat, r.typoCode || "", r.typoId || "", r.typoName || "", r.coverTree, r.coverShrub, r.coverHerb, r.coverMoss, r.coverScale, r.coverScale === "pct" ? coverPctMode(r) : "", r.assessmentMethod || "", r.nestedEnabled ? "yes" : "no", r.nestedEnabled ? r.nestingType : "", r.nestedEnabled ? r.progressionPreset : "", r.nestedEnabled ? activeProgression(r).join("/") : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLat : "", r.nestedEnabled && r.nestingType === "corner" ? r.seLon : "", r.species.length, r.notes]);
     r.species.forEach(s => speciesRows.push([r.id, r.name, s.taxon, s.family, s.native || "", s.cf ? "yes" : "no", s.notInChecklist ? "yes" : "no", s.layer, s.cover, r.nestedEnabled ? (s.grain || "") : "", r.nestedEnabled && r.nestingType === "corner" ? (s.corner || "") : "", s.loggedAt ? new Date(s.loggedAt).toISOString() : ""]));
   });
 
@@ -3309,10 +3677,17 @@ function wireNav() {
 }
 
 function wireHome() {
-  $("#newReleveBtn").addEventListener("click", () => ReleveEditor.openNew());
+  // A relevé is either free-form or follows the EDGG protocol (a particular
+  // kind of relevé), so "New relevé" asks which before opening the editor.
+  const closeProtocol = () => { $("#protocolModal").hidden = true; };
+  $("#newReleveBtn").addEventListener("click", () => { $("#protocolModal").hidden = false; });
+  $("#protocolModalClose").addEventListener("click", closeProtocol);
+  $("#protocolModal").addEventListener("click", e => { if (e.target.id === "protocolModal") closeProtocol(); });
+  $("#protocolStandardBtn").addEventListener("click", () => { closeProtocol(); ReleveEditor.openNew(); });
+  $("#protocolEdggBtn").addEventListener("click", () => { closeProtocol(); EdggEditor.openNew(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#protocolModal").hidden) closeProtocol(); });
   $("#newObservationBtn").addEventListener("click", () => ObservationEditor.openNew());
   $("#newTransectBtn").addEventListener("click", () => TransectEditor.openNew());
-  $("#newEdggBtn").addEventListener("click", () => EdggEditor.openNew());
   $("#seeAllBtn").addEventListener("click", () => { resetToTab("records"); pushView("records"); Records.refresh(); });
 }
 
@@ -3349,6 +3724,47 @@ function wireTransectReview() {
   $("#reviewApproveAllBtn").addEventListener("click", () => TransectReview.approveAllAbove(0.9));
 }
 
+// Free-text search over the whole TypoCH habitat typology (by name in any
+// language, phytosociological alliance, or code) — the manual alternative to
+// the species-based suggestions.
+function wireHabitatSearch() {
+  const input = $("#habitatSearchInput"), menu = $("#habitatAcMenu");
+  if (!input) return;
+  const render = () => {
+    const q = input.value.trim().toLowerCase();
+    if (!q || !TypoCH.available()) { menu.classList.remove("show"); return; }
+    const scored = [];
+    for (const h of TypoCH.habitats) {
+      const fields = [h.code, h.de, h.fr, h.it, h.sci].filter(Boolean).map(x => x.toLowerCase());
+      let best = 0;
+      for (const f of fields) {
+        if (f === q) { best = Math.max(best, 4); }
+        else if (f.startsWith(q)) best = Math.max(best, 3);
+        else if (f.includes(q)) best = Math.max(best, 2);
+      }
+      if (h.code.replace(/[.\-]/g, "").startsWith(q.replace(/[.\-]/g, ""))) best = Math.max(best, 3);
+      if (best) scored.push({ h, best });
+    }
+    scored.sort((a, b) => b.best - a.best || a.h.code.localeCompare(b.h.code));
+    const top = scored.slice(0, 12);
+    if (!top.length) { menu.innerHTML = `<div class="ac-empty">No habitat matches.</div>`; menu.classList.add("show"); return; }
+    menu.innerHTML = top.map(({ h }) => `
+      <div class="ac-item" data-id="${h.id}">
+        <div class="sp-name">${esc(TypoCH.name(h))}</div>
+        <div class="fam">${esc(h.code)}${h.sci ? " · " + esc(h.sci) : ""}</div>
+      </div>`).join("");
+    menu.classList.add("show");
+    $all(".ac-item", menu).forEach(el => el.addEventListener("mousedown", ev => {
+      ev.preventDefault();
+      ReleveEditor.selectHabitat(el.dataset.id);
+      input.value = ""; menu.classList.remove("show");
+    }));
+  };
+  input.addEventListener("input", render);
+  input.addEventListener("focus", render);
+  input.addEventListener("blur", () => setTimeout(() => menu.classList.remove("show"), 150));
+}
+
 function wireReleveEditor() {
   ReleveEditor._gps = wireGpsButton($("#releveGpsBtn"), $("#releveGpsStatus"), $("#releveLat"), $("#releveLon"), $("#releveAlt"), $("#releveAcc"), "releve");
   wireLiveMapUpdates($("#releveLat"), $("#releveLon"), () => ReleveEditor._map, $("#releveAcc"));
@@ -3356,9 +3772,15 @@ function wireReleveEditor() {
   wireVoiceLogging($("#voiceLogBtn"), $("#voiceLogStatus"), "releve", (sp, opts) => ReleveEditor.addSpecies(sp, opts));
   $("#coverScaleSelect").addEventListener("change", () => {
     ReleveEditor.current.coverScale = $("#coverScaleSelect").value;
+    ReleveEditor.renderCoverPctMode();
     ReleveEditor.renderSpecies();
   });
+  $all('input[name="coverPctMode"]').forEach(el => el.addEventListener("change", () => {
+    ReleveEditor.current.coverPctMode = el.value;
+    ReleveEditor.renderCoverSummary();
+  }));
   $("#releveSortSelect").addEventListener("change", () => ReleveEditor.renderSpecies());
+  wireHabitatSearch();
   $("#relevePhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, ReleveEditor.current.photoIds, $("#relevePhotos")));
   $("#releveSaveBtn").addEventListener("click", () => ReleveEditor.save());
   $("#releveDuplicateBtn").addEventListener("click", () => ReleveEditor.duplicate());
@@ -3551,6 +3973,9 @@ async function init() {
   // present) so common-species ranking works from the first dictation.
   ContextPriors.enabled = settings.contextPriors !== false;
   if (ContextPriors.enabled) ContextPriors.loadFreq();
+  // Load the Swiss habitat typology if a Swiss checklist is active (enables
+  // habitat analysis from species lists in the relevé editor).
+  if (Species.packs.some(p => (p.region || "").toLowerCase().includes("switzerland"))) TypoCH.load();
   // If AI-enhanced voice matching was already enabled in a previous session,
   // start warming it up now (from browser cache — no re-download) instead of
   // only on the next Settings visit, so it's ready by the time it's needed.

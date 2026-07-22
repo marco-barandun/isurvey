@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="styles.css?v=30">
+  <link rel="stylesheet" href="styles.css?v=36">
   <link rel="stylesheet" href="vendor/leaflet.css">
   <script>
     (() => { try { const t = localStorage.getItem("isurvey.theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch {} })();
@@ -30,6 +30,29 @@
         </button>
       </div>
       <div class="modal-body" id="infoModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Relevé protocol chooser: a relevé is either free-form or follows the
+       standardised EDGG nested-plot methodology (a particular kind of relevé). -->
+  <div id="protocolModal" class="modal-backdrop" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="protocolModalTitle">
+      <div class="modal-head">
+        <h3 id="protocolModalTitle">New relevé — pick a protocol</h3>
+        <button type="button" id="protocolModalClose" class="btn btn-icon" aria-label="Close">
+          <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <button type="button" class="protocol-choice" id="protocolStandardBtn">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <span class="pc-main"><span class="pc-title">Standard relevé</span><span class="pc-sub">Free-form plot survey — species list with cover-abundance, your own plot size.</span></span>
+        </button>
+        <button type="button" class="protocol-choice" id="protocolEdggBtn">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="3" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="14" y="14" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>
+          <span class="pc-main"><span class="pc-title">EDGG standardised plot</span><span class="pc-sub">A relevé following the EDGG nested-plot methodology — 100 m² with nested subplots in two corners, structural &amp; biomass sampling.</span></span>
+        </button>
+      </div>
     </div>
   </div>
 
@@ -61,7 +84,7 @@
         <button class="tile tile-primary" id="newReleveBtn">
           <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 9h10M7 13h10M7 17h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           <span>New relevé</span>
-          <small>Plot survey with species &amp; cover-abundance</small>
+          <small>Plot survey — standard or EDGG protocol</small>
         </button>
         <button class="tile" id="newTransectBtn">
           <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><path d="M3 18c4-8 6 6 10-2 2-4 4-4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="12.2" r="1.4" fill="currentColor"/><circle cx="13.3" cy="14.8" r="1.4" fill="currentColor"/><circle cx="19" cy="11.5" r="1.4" fill="currentColor"/></svg>
@@ -72,11 +95,6 @@
           <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><path d="M12 21s-7-5.2-7-10.5C5 6.9 8.1 4 12 4s7 2.9 7 6.5C19 15.8 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="10.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
           <span>New observation</span>
           <small>Quick single-species record</small>
-        </button>
-        <button class="tile" id="newEdggBtn">
-          <svg viewBox="0 0 24 24" class="ic-lg" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="3" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="14" y="14" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="5" y="5" width="3" height="3" fill="none" stroke="currentColor" stroke-width="1"/><rect x="16" y="16" width="3" height="3" fill="none" stroke="currentColor" stroke-width="1"/></svg>
-          <span>New EDGG plot</span>
-          <small>Standardised nested-plot grassland methodology</small>
         </button>
       </div>
 
@@ -107,7 +125,7 @@
       </div>
 
       <div class="editor-scroll">
-        <details class="fold" open>
+        <details class="fold fold-primary" open>
           <summary>Species list <span id="speciesCount" class="tag"></span></summary>
           <div class="fold-body">
             <button type="button" id="voiceLogBtn" class="btn full voice-log-btn" hidden>
@@ -117,22 +135,28 @@
             </button>
             <div id="voiceLogStatus" class="hint"></div>
 
-            <div class="ac-wrap" style="margin-top:12px">
-              <label class="field-label" for="speciesSearchInput">Add species manually <span class="info-dot" role="button" tabindex="0" data-info="speciesSearch" aria-label="About species search">i</span></label>
-              <input id="speciesSearchInput" class="input" autocomplete="off" placeholder="Type to search — e.g. dro rot for Drosera rotundifolia">
+            <div class="ac-wrap" style="margin-top:10px">
+              <input id="speciesSearchInput" class="input" autocomplete="off" placeholder="Add a species — type to search (dro rot → Drosera rotundifolia)">
               <div id="speciesAcMenu" class="ac-menu"></div>
             </div>
 
-            <label class="field-label" for="releveSortSelect">Sort by</label>
-            <select id="releveSortSelect" class="input small">
-              <option value="added">Order added</option>
-              <option value="alpha">Alphabetical</option>
-              <option value="family">Family</option>
-              <option value="cover">Cover (highest first)</option>
-              <option value="layer">Layer</option>
-            </select>
+            <div class="species-toolbar">
+              <span class="st-tips">Abbreviations work <span class="info-dot" role="button" tabindex="0" data-info="speciesSearch" aria-label="About species search">i</span></span>
+              <span class="st-spacer"></span>
+              <label class="st-sort">Sort
+                <select id="releveSortSelect" class="input small">
+                  <option value="added">Order added</option>
+                  <option value="alpha">Alphabetical</option>
+                  <option value="family">Family</option>
+                  <option value="cover">Cover (highest first)</option>
+                  <option value="layer">Layer</option>
+                </select>
+              </label>
+            </div>
 
             <div id="speciesTable" class="species-table"></div>
+
+            <div id="coverPctSummary" class="cover-sum" hidden></div>
 
             <div id="speciesCorrectorBox" class="ac-wrap corrector-box" hidden>
               <div class="hint" id="speciesCorrectorLabel"></div>
@@ -142,24 +166,37 @@
               <button type="button" id="speciesCorrectorCancelBtn" class="btn btn-ghost full" style="margin-top:6px">Cancel</button>
             </div>
 
-            <details class="fold" style="margin-top:14px">
-              <summary>Recording setup — cover scale &amp; method</summary>
-              <div class="fold-body">
-                <label class="field-label" for="coverScaleSelect">Cover-abundance scale <span class="info-dot" role="button" tabindex="0" data-info="coverScale" aria-label="About cover-abundance scales">i</span></label>
-                <select id="coverScaleSelect" class="input">
-                  <option value="bb">Braun-Blanquet (r + 1 2 3 4 5)</option>
-                  <option value="bb-ext">Braun-Blanquet extended (r + 1 2m 2a 2b 3 4 5)</option>
-                  <option value="pct">Percentage cover</option>
-                </select>
-
-                <div class="field-label" style="margin-top:10px">Cover assessment method <span class="tag">tap ⓘ for details</span></div>
-                <div id="methodPicker" class="method-grid"></div>
-              </div>
-            </details>
           </div>
         </details>
 
-        <details class="fold" id="releveNestedFold">
+        <div class="section-divider"><span>Plot details &amp; setup</span><span class="sd-note">optional — the species list above is the record</span></div>
+
+        <details class="fold fold-secondary">
+          <summary>Recording setup — cover scale &amp; method</summary>
+          <div class="fold-body">
+            <label class="field-label" for="coverScaleSelect">Cover-abundance scale <span class="info-dot" role="button" tabindex="0" data-info="coverScale" aria-label="About cover-abundance scales">i</span></label>
+            <select id="coverScaleSelect" class="input">
+              <option value="bb">Braun-Blanquet (r + 1 2 3 4 5)</option>
+              <option value="bb-ext">Braun-Blanquet extended (r + 1 2m 2a 2b 3 4 5)</option>
+              <option value="pct">Percentage cover</option>
+            </select>
+
+            <div id="coverPctModeBlock" hidden style="margin-top:10px">
+              <label class="field-label">How the percentages combine <span class="info-dot" role="button" tabindex="0" data-info="coverPctMode" aria-label="About percentage-cover interpretation">i</span></label>
+              <div class="segmented segmented-col" id="coverPctModeSeg">
+                <label class="seg"><input type="radio" name="coverPctMode" value="independent"><span>Independent cover <small>overlap ok · Σ can exceed 100 %</small></span></label>
+                <label class="seg"><input type="radio" name="coverPctMode" value="ground"><span>Projective ground cover <small>one layer · Σ ≤ 100 %</small></span></label>
+                <label class="seg"><input type="radio" name="coverPctMode" value="relative"><span>Relative share <small>normalised · Σ = 100 %</small></span></label>
+              </div>
+              <p class="hint" style="margin-top:4px">Recommended: <strong>Independent cover</strong> — the standard convention; tap ⓘ for why.</p>
+            </div>
+
+            <div class="field-label" style="margin-top:10px">Cover assessment method <span class="tag">tap ⓘ for details</span></div>
+            <div id="methodPicker" class="method-grid"></div>
+          </div>
+        </details>
+
+        <details class="fold fold-secondary" id="releveNestedFold">
           <summary>Nested sampling <span class="tag">optional</span> <span class="info-dot" role="button" tabindex="0" data-info="nested" aria-label="About nested sampling">i</span></summary>
           <div class="fold-body">
             <p class="hint">Record each species by the smallest sub-plot area it first appears in, to build a species-area curve. Off by default — the species list above works the same either way.</p>
@@ -206,7 +243,7 @@
           </div>
         </details>
 
-        <details class="fold" id="releveLocationFold">
+        <details class="fold fold-secondary" id="releveLocationFold">
           <summary>Plot &amp; location</summary>
           <div class="fold-body">
             <div class="settings-grid">
@@ -234,7 +271,7 @@
           </div>
         </details>
 
-        <details class="fold">
+        <details class="fold fold-secondary">
           <summary>Plot structure</summary>
           <div class="fold-body">
             <div class="settings-grid">
@@ -261,7 +298,21 @@
           </div>
         </details>
 
-        <details class="fold">
+        <details class="fold fold-secondary" id="releveHabitatFold" hidden>
+          <summary>Habitat — TypoCH <span class="tag">Switzerland</span> <span class="info-dot" role="button" tabindex="0" data-info="typoch" aria-label="About habitat analysis">i</span></summary>
+          <div class="fold-body">
+            <p class="hint" style="margin-top:0">Suggested habitat types from the species you've recorded, ranked by the official TypoCH score (character species weighted, cover-boosted). The big number is the score; below it, how many of your species support it. Tap ⓘ for the formula, tap a card to assign it, or browse the full typology.</p>
+            <div id="habitatSuggestions"></div>
+            <div id="habitatSelected" class="hint" style="margin-top:8px"></div>
+            <div class="ac-wrap" style="margin-top:10px">
+              <label class="field-label" for="habitatSearchInput">Find a habitat by name or code</label>
+              <input id="habitatSearchInput" class="input" autocomplete="off" placeholder="e.g. Mesobromion, pelouse sèche, 4.-2.4…">
+              <div id="habitatAcMenu" class="ac-menu"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="fold fold-secondary">
           <summary>Photos &amp; notes</summary>
           <div class="fold-body">
             <div class="photo-row">
@@ -908,7 +959,6 @@
           <label class="seg"><input type="checkbox" value="releve" checked><span>Relevés</span></label>
           <label class="seg"><input type="checkbox" value="transect" checked><span>Transects</span></label>
           <label class="seg"><input type="checkbox" value="observation" checked><span>Observations</span></label>
-          <label class="seg"><input type="checkbox" value="edgg" checked><span>EDGG plots</span></label>
         </div>
         <div id="recordsListFull" class="record-list" style="margin-top:12px"></div>
       </div>
@@ -1016,7 +1066,7 @@
     </button>
   </nav>
 
-  <script src="app.js?v=30"></script>
+  <script src="app.js?v=36"></script>
   <script>
     (() => {
       const root = document.documentElement;

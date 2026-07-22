@@ -2,17 +2,18 @@
 
 /* Cache-first app shell so iSurvey works with zero connectivity once
    installed. Bump CACHE_NAME on every deploy to invalidate old caches. */
-const CACHE_NAME = "isurvey-v30";
+const CACHE_NAME = "isurvey-v36";
 
 const SHELL_ASSETS = [
   "./",
   "index.html",
-  "styles.css?v=30",
-  "app.js?v=30",
+  "styles.css?v=36",
+  "app.js?v=36",
   "manifest.json",
   "species/index.json",
   "species/infoflora-ch.json",
   "species/frequency-ch.json",
+  "species/typoch-ch.json",
   "vendor/leaflet.js",
   "vendor/leaflet.css",
   "icons/icon.svg",

@@ -153,6 +153,21 @@ textarea.input { resize: vertical; }
 }
 .seg input:checked + span { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); font-weight: 700; }
 
+/* Stacked variant: full-width rows with a secondary caption (cover % modes). */
+.segmented-col { flex-direction: column; flex-wrap: nowrap; }
+.segmented-col .seg { display: block; }
+.segmented-col .seg span { display: block; border-radius: 10px; padding: 9px 12px; }
+.segmented-col .seg span small { display: block; font-weight: 400; font-size: 11px; opacity: 0.7; margin-top: 2px; }
+
+/* Running percentage-cover total under the species list. */
+.cover-sum {
+  margin: 8px 0 2px; padding: 7px 11px; border-radius: 10px; font-size: 13px;
+  border: 1px solid var(--hair-strong); background: var(--panel-2, var(--panel));
+}
+.cover-sum.ok { border-color: var(--accent-line); color: var(--accent-strong); background: var(--accent-soft); }
+.cover-sum.warn { border-color: #c9822a; color: #c9822a; background: rgba(201, 130, 42, 0.10); }
+.cover-sum.muted { opacity: 0.75; }
+
 /* ============================ info modal ============================ */
 .modal-backdrop {
   position: fixed; inset: 0; background: rgba(10, 16, 12, 0.5); z-index: 200;
@@ -215,6 +230,44 @@ textarea.input { resize: vertical; }
 }
 .btn .info-dot:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-line); opacity: 1; }
 .info-dot:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+
+/* ---- TypoCH habitat suggestions ---- */
+.habitat-list { display: flex; flex-direction: column; gap: 6px; }
+.habitat-card {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 9px 11px; border-radius: var(--r-sm); border: 1px solid var(--hair-strong);
+  background: var(--surface); cursor: pointer; font: inherit; color: var(--ink);
+}
+.habitat-card:active { transform: scale(0.995); }
+.habitat-card.selected { border-color: var(--accent-line); background: var(--accent-soft); }
+.habitat-card .h-bar { flex: none; width: 6px; align-self: stretch; border-radius: 3px; background: var(--accent); opacity: 0.85; }
+.habitat-card .h-main { flex: 1; min-width: 0; }
+.habitat-card .h-name { font-weight: 600; font-size: 13.5px; line-height: 1.25; }
+.habitat-card .h-meta { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.habitat-card .h-count {
+  flex: none; display: flex; flex-direction: column; align-items: center; gap: 1px;
+  color: var(--accent-strong); background: var(--accent-soft);
+  border-radius: 10px; padding: 4px 9px; white-space: nowrap; min-width: 44px;
+}
+.habitat-card .h-count .h-score { font-size: 16px; font-weight: 800; line-height: 1.05; }
+.habitat-card .h-count .h-sp { font-size: 9.5px; font-weight: 600; opacity: 0.8; }
+.habitat-empty { font-size: 12.5px; color: var(--faint); padding: 6px 2px; }
+
+/* Relevé-protocol chooser (Standard vs EDGG) */
+.protocol-choice {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  padding: 13px 14px; margin-bottom: 10px; border-radius: var(--r-sm);
+  border: 1px solid var(--hair-strong); background: var(--surface);
+  cursor: pointer; font: inherit; color: var(--ink);
+}
+.protocol-choice:last-child { margin-bottom: 0; }
+.protocol-choice:active { transform: scale(0.995); }
+.protocol-choice:hover { border-color: var(--accent-line); background: var(--accent-soft); }
+.protocol-choice svg { flex: none; width: 30px; height: 30px; color: var(--accent-strong); }
+.protocol-choice .pc-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.protocol-choice .pc-title { font-weight: 700; font-size: 14.5px; }
+.protocol-choice .pc-sub { font-size: 12px; color: var(--muted); line-height: 1.35; }
+.stat-sub { display: inline-block; font-size: 10px; font-weight: 700; opacity: 0.7; }
 
 /* ============================ app / views ============================ */
 .app { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 12px); min-height: calc(100vh - var(--bar-h)); }
@@ -345,16 +398,23 @@ textarea.input { resize: vertical; }
 .ac-empty { padding: 10px 12px; color: var(--faint); font-size: 13px; }
 .ac-freetext .sp-name { color: var(--muted); font-style: normal; }
 
-.species-table { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.species-table { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 .species-row {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 10px;
   background: var(--ground); border: 1px solid var(--hair); border-radius: var(--r-sm);
-  padding: 8px 10px;
+  padding: 11px 12px;
 }
 .species-row .sp-info { flex: 1; min-width: 0; }
-.species-row .sp-name { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.species-row .sp-fam { font-size: 11px; color: var(--muted); }
-.species-row select.input, .species-row input.input { width: auto; min-width: 64px; padding: 6px 8px; font-size: 13px; }
+.species-row .sp-name { font-weight: 600; font-size: 15.5px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.species-row .sp-fam { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.species-row select.input, .species-row input.input { width: auto; min-width: 60px; padding: 6px 8px; font-size: 13px; }
+/* Layer picker is secondary metadata — keep it quiet so the name + cover read first. */
+.species-row select.sp-layer { min-width: 58px; color: var(--muted); border-color: var(--hair); background: transparent; }
+/* Cover value is the key datum of a relevé row — make it prominent. */
+.species-row .sp-cover {
+  flex: none; width: 58px; min-width: 58px; text-align: center; font-weight: 700; font-size: 15px;
+  color: var(--accent-strong); border-color: var(--accent-line); background: var(--accent-soft);
+}
 .species-row .rm-btn { background: none; border: none; color: var(--faint); cursor: pointer; padding: 4px; flex: none; }
 .species-row .rm-btn:hover { color: var(--danger); }
 .sp-name-btn {
@@ -363,6 +423,37 @@ textarea.input { resize: vertical; }
   text-decoration: underline dotted var(--faint); text-underline-offset: 2px;
 }
 .sp-name-btn:hover, .chip-name-btn:hover { color: var(--accent-strong); }
+
+/* Compact toolbar (info + sort) above the species list. */
+.species-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.species-toolbar .st-spacer { flex: 1; }
+.species-toolbar .st-tips { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--faint); }
+.species-toolbar .st-sort { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.species-toolbar .st-sort select { min-width: 132px; }
+
+/* Make the species list the visual hero; push plot metadata into the background. */
+.fold-primary { border-color: var(--hair-strong); }
+.fold-primary > summary { font-size: 15.5px; }
+.section-divider {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 18px 2px 8px; padding-top: 4px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--faint);
+}
+.section-divider .sd-note { font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--faint); opacity: 0.85; }
+.fold-secondary { background: transparent; border-color: var(--hair); }
+.fold-secondary > summary { font-size: 13px; font-weight: 600; color: var(--muted); }
+.fold-secondary > summary::before { opacity: 0.6; }
+.fold-secondary[open] > summary { color: var(--ink); }
+
+/* On narrow (field) screens the species name must never be squeezed by the
+   row's controls — give the name its own full-width line and wrap the
+   layer / cover / cf / remove controls onto a second line beneath it. */
+@media (max-width: 480px) {
+  .species-row { flex-wrap: wrap; }
+  .species-row .sp-info { flex: 1 1 100%; }
+  .species-row .sp-name { white-space: normal; }
+  .species-row .rm-btn { margin-left: auto; }
+}
 
 .corrector-box {
   margin-top: 10px; padding: 12px; border-radius: var(--r-md);

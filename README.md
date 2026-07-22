@@ -19,25 +19,25 @@ search, saving records, photos, everything.
 2. **Install it**: use your browser's "Install app" / "Add to Home Screen"
    prompt. From then on it opens like a native app and works fully offline —
    the first load caches everything it needs (app code + species database).
-3. **New relevé / transect**: GPS capture starts automatically the moment you
-   open a new one — no button to remember to tap — and shows the fixed point
-   on a small map with an accuracy circle while it locates; once it settles,
-   that section collapses out of the way and the **species list is what you
-   land on**, since that's the actual work of a survey. Add species by typing
-   (abbreviation search: `dro rot` for *Drosera rotundifolia*) or by **voice
-   logging** (see below). Sort the list — alphabetical, by family, by cover,
-   by layer (relevé) or certainty (transect) — without touching the
-   underlying recorded order. Every entry remembers exactly when it was
-   logged.
-4. **New observation**: a quicker one-species record — species, GPS, date,
+3. **New relevé**: pick a **protocol** — a *standard* free-form relevé, or an
+   *EDGG standardised plot* (a particular kind of relevé following the EDGG
+   nested-plot methodology, see [EDGG Grassland Plots](#edgg-grassland-plots)
+   below). Either way it's a relevé: it counts, filters and exports as one.
+   For a standard relevé (and for a transect), GPS capture starts automatically
+   the moment you open it — no button to remember to tap — and shows the fixed
+   point on a small map with an accuracy circle while it locates; once it
+   settles, that section collapses out of the way and the **species list is
+   what you land on**, since that's the actual work of a survey. Add species by
+   typing (abbreviation search: `dro rot` for *Drosera rotundifolia*) or by
+   **voice logging** (see below). Sort the list — alphabetical, by family, by
+   cover, by layer (relevé) or certainty (transect) — without touching the
+   underlying recorded order. Every entry remembers exactly when it was logged.
+4. **New transect**: walk and log a species list hands-free.
+5. **New observation**: a quicker one-species record — species, GPS, date,
    photo, notes. The mic button next to its search box dictates a single name
    (see note below). GPS starts automatically here too.
-5. **New EDGG plot**: a standardised grassland diversity plot following the
-   EDGG methodology (see [EDGG Grassland Plots](#edgg-grassland-plots) below)
-   — nested species lists at nine grain sizes per corner, cover spot-checks,
-   structural variables, and optional biomass sampling. Both corners start
-   GPS capture automatically like the other record types.
-6. **Records** tab: browse and search everything you've logged.
+6. **Records** tab: browse and search everything you've logged (EDGG plots are
+   grouped under Relevés).
 7. **Settings** tab: export to CSV (for GIS/stats tools) or a full JSON
    backup (records + photos, for moving to another device), import a backup,
    or erase local data.
@@ -115,10 +115,14 @@ uploaded anywhere:
   on screen (alphabetical, family, certainty, or recorded order).
 - **observation**: one taxon (+ native status, `cf.` flag, free-text flag) +
   GPS/date/photo/notes. The taxon can be blank if a photo is attached.
-- **edgg**: an EDGG standardised grassland plot — see
-  [EDGG Grassland Plots](#edgg-grassland-plots) below for the full data
-  captured (nested species lists per corner, cover spot-checks, structural
-  variables, optional biomass).
+- **edgg**: a relevé recorded with the EDGG protocol — a standardised
+  grassland plot; see [EDGG Grassland Plots](#edgg-grassland-plots) below for
+  the full data captured (nested species lists per corner, cover spot-checks,
+  structural variables, optional biomass). It's a `type: "edgg"` internally but
+  is treated as a relevé everywhere in the UI (created from the *New relevé*
+  protocol picker, counted and filtered under Relevés); its richer two-corner
+  structure is why it keeps a dedicated editor rather than folding into the
+  standard relevé form.
 - **photos**: attached to a relevé, observation, or EDGG plot, stored as blobs.
 
 ### Cover-abundance scales
@@ -127,6 +131,32 @@ Selectable per relevé:
 - **Braun-Blanquet**: `r + 1 2 3 4 5`
 - **Braun-Blanquet extended**: `r + 1 2m 2a 2b 3 4 5`
 - **Percentage cover**: direct 0–100 estimate
+
+### Percentage-cover interpretation
+
+When the scale is **Percentage cover**, the editor also asks *how the
+per-species percentages combine* — the same plot yields a different total
+under each convention, so mixing them makes relevés incomparable. A running
+**Σ** total under the species list checks the values live against the chosen
+convention, and an **ⓘ** button illustrates all three with small diagrams:
+
+- **Independent cover** *(recommended, default)* — each species judged on its
+  own as 0–100 % of the plot it overlies. Because vegetation grows in layers,
+  the values can sum to **more than 100 %**. This is the Braun-Blanquet /
+  phytosociological convention: every species is estimated separately (so one
+  bad guess doesn't distort the rest), no field arithmetic is forced, and real
+  structural information is preserved. Relative shares can always be derived
+  afterwards by normalising. The Σ readout is neutral (any total is valid).
+- **Projective ground cover** — the canopy is treated as one projected layer;
+  species partition the ground and the rest is bare soil / litter / rock, so
+  the total is **≤ 100 %**. The Σ readout shows the bare-ground remainder and
+  warns if the sum exceeds 100 %. Use when gaps / bare ground are the point
+  (erosion, grazing impact).
+- **Relative share** — values are rescaled so the species sum to **exactly
+  100 %**; each is a dominance / yield share rather than real ground cover. The
+  Σ readout nudges toward 100 %. Use only when composition must sum to 100 %.
+
+The chosen mode is stored per relevé and exported as `cover_pct_mode`.
 
 ### Cover-assessment method
 
@@ -184,6 +214,49 @@ each species row gains a **grain size** dropdown (labelled by real edge
 length, e.g. "10 cm" or "3.16 m", not just the raw m² value) and, in
 corner-based mode, an **NW / SE** picker — otherwise the row looks and
 behaves exactly like a normal relevé entry.
+
+### Habitat analysis (TypoCH, Switzerland)
+
+When a Swiss species pack is loaded, the relevé editor gains a **Habitat —
+TypoCH** fold that classifies the plot from the species you've recorded,
+using the Swiss habitat typology (TypoCH — Delarze, Gonseth, Eggenberg &
+Vust 2015, *Lebensräume der Schweiz* / *Guide des milieux naturels de
+Suisse*, 3rd ed.). Every habitat type has a set of **character species**;
+the fold does the reverse lookup — it ranks the habitats whose character
+species are most present, so the vegetation itself proposes the habitat.
+
+- Suggestions update live as species are added, ranked by the **official
+  InfoFlora *Lebensraumanalyse* score**, and each card shows that score plus
+  how many of your species support it, with its TypoCH code, phytosociological
+  alliance and EUNIS crosswalk.
+- Tap a suggestion to **assign** it to the relevé, or **search the full
+  typology** by name, code or alliance (localised DE / FR / IT names).
+- It's a decision aid, not a verdict — confirm against the habitat on the
+  ground.
+
+**How the score is computed** (per *Anleitung für die TypoCH-Lebensraumanalyse
+mit Artenlisten*, Documenta InfoFlora 2024): every recorded character species
+adds points to each habitat it characterises —
+
+```
+ScoreLE = ΣK + 2·Σdom_K + 4·ΣC + 8·Σdom_C
+```
+
+An ordinary character species (K) scores 1, a *characteristic* species (C,
+italic in the reference work) scores 4. The weight **doubles** for any taxon
+recorded co-dominant in the plot (Braun-Blanquet class ≥ 2, or > 10 % cover)
+that the habitat also *expects* to be dominant (bold in the reference work).
+Without cover data this reduces to `ΣK + 4·ΣC`. The implementation reproduces
+the guide's worked Tessin-forest example exactly (habitat 6.3.5 scoring 16 from
+the list alone, 24 with cover weighting). The ⓘ button shows the formula and
+per-species weights.
+
+The assignment is stored per relevé and exported as `typoch_code`,
+`typoch_id` and `typoch_name`. The data pack (`species/typoch-ch.json`) is
+built from the InfoFlora TypoCH species-list workbook by
+`scripts/build_typoch.py`, matching associations to the bundled checklist by
+normalised name (324 habitat types across levels 1–4; ~4200 character-species
+associations).
 
 ### GPS capture
 
@@ -432,10 +505,12 @@ nested-plot sampling methodology for grassland diversity, following:
   sampling grassland diversity: second amendment"* — extended it with the
   1000 m² module and quantitative biomass sampling.
 
-This is the one record type in iSurvey that follows an external scientific
-protocol exactly rather than a general-purpose field form, so the geometry,
-grain sizes, and recorded variables below match the papers, not a
-simplification of them.
+An EDGG plot is a **relevé recorded with the EDGG protocol** — conceptually a
+particular kind of relevé, so it's created from the *New relevé* protocol
+picker and counts/filters as a relevé. What sets it apart is that it follows an
+external scientific protocol exactly rather than a general-purpose field form,
+so the geometry, grain sizes, and recorded variables below match the papers,
+not a simplification of them — which is why it keeps its own dedicated editor.
 
 ### Plot geometry
 

@@ -212,18 +212,39 @@ sent to Google's (Chrome/Edge/Brave/Arc) or Apple's (Safari) speech service,
 there's no offline speech-to-text in a browser. Typing/search still work
 fully offline; the mic buttons only appear if your browser supports it.
 
+**Set your accent.** The recognizer transcribes Latin names far more
+faithfully when it knows which language you're pronouncing them in, so
+**Settings → Recognition language / accent** lets you pick English, Italian,
+German or French — it's the single most effective thing you can do for
+accuracy if you don't speak with an English accent, and it's applied to the
+speech engine directly (it-IT / de-DE / fr-FR / en-US). It governs *both*
+standard dictation and the AI option below.
+
 The raw transcript is never trusted as a literal string — generic dictation
 models mangle Latin binomials, and mishear the same word differently
-depending on the speaker's accent. Instead, every recognized phrase (the
-engine's top several alternative guesses, not just its first pick) is scored
-against the entire bundled taxon list using a phonetic + fuzzy-edit-distance
-match, including a whole-word-blob comparison specifically so that a Latin
-word getting mis-split into fake English fragments (e.g. "Drosera" heard as
-"dro sarah") still resolves correctly. Then:
+depending on the speaker's accent. Instead, every recognized phrase (up to a
+dozen of the engine's alternative guesses, not just its first pick) is scored
+against the entire bundled taxon list using a **phonetic + fuzzy-edit-distance
+match**. The phonetic code is deliberately *accent-invariant*: it normalizes
+Latin digraphs and merges voiced/unvoiced consonant pairs (v/f, b/p, d/t, g/k,
+z/s) — the differences that vary by accent — so a German "fulgaris"/"wulgaris"
+still lands on *vulgaris* and "brunella" on *Prunella*. A whole-word-blob
+comparison additionally rescues a Latin word mis-split into fake fragments
+(e.g. "Drosera" heard as "dro sarah", or "Carex flacca" as "carrots flacca").
+Then:
 - **confident, clear winner** → filled in / added automatically
 - **plausible but ambiguous** → shown as a short tap-to-pick list
 - **not recognizable at all** → it speaks "that wasn't clear, please repeat"
   and listens again (up to 3 times, then falls back to manual entry)
+
+**Two-step dictation (genus → species).** Under the observation search box,
+*Dictate in two steps* splits a hard binomial into two short, easy utterances:
+say the **genus** (short, distinctive, recognised reliably), then say just the
+**epithet**, which is matched against *only* the species of that genus — a
+handful of names instead of thousands. Much more reliable for long/unfamiliar
+names and strong accents; verified to resolve even rough input like
+"carrots" → *Carex*, "power" → *Poa*, then "bulgaria" → *vulgaris* within
+*Silene*.
 
 **Voice logging specifically** (walking a relevé or transect) uses one more
 layer on top: since several species said in sequence can land in a single
@@ -242,6 +263,34 @@ well as saying "subsp." would, since skipping a rank word isn't treated as
 an incomplete match the way skipping a real name word is. A few spoken/typed
 alternate forms are also normalized to the abbreviation used in the
 taxonomy — "aggregate" or "agg" both match a taxon written with "aggr."
+
+**Likely-species priors** (*Settings → "Prefer species that are likely here"*,
+on by default). When resolving a spoken name, the matcher gently favours
+species that are actually plausible at your location, which fixes the biggest
+remaining source of wrong picks: a bare or ambiguous utterance landing on a
+rare look-alike. Two signals feed it:
+- **Frequency** — how commonly each species is recorded in Switzerland
+  (bundled in `species/frequency-ch.json`, built from iNaturalist observation
+  counts; works offline). So a spoken "Achillea" leans to the common
+  *A. millefolium* over the rare *A. atrata* / *A. ageratum* — verified: with
+  priors off, a genus-only "achillea" returns species alphabetically
+  (*ageratum* first); with priors on, *A. millefolium* is first.
+- **Nearby (the primary signal, global)** — when online with GPS, it fetches
+  which species have actually been recorded around the record's location from
+  iNaturalist — anywhere in the world, not just Switzerland. It queries several
+  concentric rings (50 / 150 / 400 km) and weights each species by *how close*
+  its nearest records are, so likelihood falls off with distance while
+  regional species are still kept (broad, not a tight bubble). Cached per ~cell
+  so a place you've visited keeps working offline. The bundled frequency table
+  is the weaker offline/fallback baseline; the location signal wins where it's
+  available.
+
+It is deliberately **relaxed**: a prior only nudges the *ranking* of otherwise
+comparable candidates — it never inflates the confidence used for auto-fill and
+never gates a species out, so a rare plant you genuinely said is still found
+(verified: "Achillea atrata" said clearly still returns *A. atrata* first, and
+the whole accent-mishearing battery still resolves 14/14 with priors on).
+Rebuild the frequency table any time with `scripts/build_frequency.py`.
 
 **Observation form**: the mic button dictates one species name into the search
 box.
@@ -275,14 +324,30 @@ plausible candidate name — "how well does this recording match exactly
 [Whisper](https://github.com/openai/whisper) speech model
 ([transformers.js](https://github.com/huggingface/transformers.js),
 vendored — no CDN at runtime). Concretely, per utterance: the audio is
-transcribed (beam search) to get a rough guess; that guess narrows the
-~4,200-taxon checklist down to a short list of plausible candidates via the
-same phonetic/fuzzy matcher described above; each of those candidates is then
+transcribed to get a rough guess; that guess narrows the ~4,200-taxon
+checklist down to a short list of plausible candidates via the same
+phonetic/fuzzy matcher described above; each of those candidates is then
 teacher-force-scored straight from the audio's acoustic encoding; and the
 final pick **blends the acoustic score with the text-match score**, so the
 winner has to satisfy both the recording *and* the spelling. That blend is
 what kills most near-homophone confusions a text-only or audio-only pick
-makes on its own — the accuracy of the feature rides on it.
+makes on its own — the accuracy of the feature rides on it. Obvious speech-
+model hallucinations on quiet/breath clips ("thank you", subtitle credits,
+music tags, bare punctuation) are filtered out so they can't be logged or
+crowd out a real match.
+
+**Accents (the big lever): recognition language.** A Latin binomial spoken by
+an Italian, German or French botanist is transcribed far more faithfully when
+Whisper decodes it under that speaker's *own* language than through an English
+lens — and the acoustic score is only meaningful when computed under the same
+language the utterance was produced in. So **Settings → Recognition language /
+accent** lets you pick **English, Italian, German, French**, or **Multilingual**
+(the default): in multilingual mode every utterance is decoded under all four
+languages, their transcripts are pooled into the shortlist, and each candidate
+is rescored under each language keeping its best — so the match lands on
+whatever language your pronunciation is actually closest to, no matter the
+accent. Picking your single language instead is faster (one language per
+utterance) and ideal when the whole team shares an accent.
 
 **Setup**: enabling it downloads the model from Hugging Face over a
 connection, once — the same "needs network" carve-out voice dictation already
@@ -298,18 +363,23 @@ the engine behind **"Start voice logging"** on a relevé or transect: instead
 of the Web Speech API's own continuous-listening mode, a voice-activity
 detector watches the microphone directly (rising volume starts capturing an
 utterance, a sustained pause ends it) and each captured utterance goes
-through the same audio-rescoring pipeline as single-field dictation.
+through the same audio-rescoring pipeline as single-field dictation. The
+detector is **noise-adaptive**: it samples the ambient level at startup and
+keeps tracking it, setting the speech threshold relative to that floor (with
+hysteresis so a name isn't chopped mid-word), so it doesn't false-trigger on
+wind or background in the field, and still catches normal speech in a quiet
+spot.
 
 **Tradeoffs**: recognition runs on your device's CPU, so each utterance
 takes a few seconds and uses noticeably more battery than the standard
 mic button — worth it for single-species lookups (the Observation search
 box, the tap-to-correct picker), and workable but slower-paced for voice
-logging than the Web Speech path. Two species said back-to-back with too
-short a pause between them may land in one utterance and get missed —
-there's no equivalent yet of the text-based multi-species splitting
-(`segmentTranscript`) the standard dictation path uses; say one species,
-pause, then the next. The recognition language is currently fixed to
-English rather than following your device locale.
+logging than the Web Speech path. Multilingual mode multiplies the
+transcription cost by the number of languages, so if it feels slow, set your
+single language in Settings. Two species said back-to-back with too short a
+pause between them may land in one utterance and get missed — there's no
+equivalent yet of the text-based multi-species splitting (`segmentTranscript`)
+the standard dictation path uses; say one species, pause, then the next.
 
 ### Correcting a species
 
@@ -464,8 +534,9 @@ for the pack format and how to add more lists (e.g. a Euro+Med pack later).
 index.html / styles.css / app.js   — the app (no build step, no framework)
 whisper.js                         — experimental on-device AI voice matching (lazy-loaded ES module)
 sw.js / manifest.json / icons/     — PWA: offline caching + installability
-species/                           — bundled offline taxon lists
+species/                           — bundled offline taxon lists + frequency-ch.json (likely-species prior)
 scripts/build_species_pack.py      — xlsx → species pack JSON converter
+scripts/build_frequency.py         — iNaturalist Swiss counts → frequency-ch.json
 ```
 
 ## Privacy

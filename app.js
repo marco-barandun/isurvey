@@ -129,7 +129,7 @@ const Store = {
   deletePhoto: id => idbDelete("photos", id),
   allPhotos: () => idbAll("photos"),
   getSettings: () => idbGet("settings", "app").then(s =>
-    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30, aiVoiceEnabled: false, aiVoiceQuality: "accurate" }, s || {})),
+    Object.assign({ key: "app", defaultScale: "bb", activePacks: null, gpsThreshold: 10, voiceSpeakFeedback: true, voiceReviewCheckpoint: 30, aiVoiceEnabled: false, aiVoiceQuality: "accurate", aiVoiceLang: "multi", contextPriors: true }, s || {})),
   saveSettings: s => { s.key = "app"; return idbPut("settings", s); },
   wipeAll: () => Promise.all([idbClear("records"), idbClear("photos"), idbClear("settings")]),
 };
@@ -559,29 +559,149 @@ function createLocationMap(containerId, wrapId) {
 /* "that wasn't clear, please repeat" and re-listen (uncertain).  */
 /* ---------------------------------------------------------- */
 
-/* Latin/scientific-name-tuned phonetic code — not a strict
-   Metaphone port, just consonant-skeleton reduction so that
-   differently-mispronounced or mis-transcribed words with the
-   same underlying sound structure land close together. */
+/* ============================================================
+   CONTEXT PRIORS — weight the candidate set by what's actually plausible
+   here and now, so the matcher gently prefers likely species over rare
+   look-alikes. Two signals:
+     • national frequency — bundled (species/frequency-ch.json, from Swiss
+       iNaturalist observation counts): always on, offline. Fixes generic
+       ranking ("Achillea millefolium" ≫ "A. atrata" ≫ "A. ageratum").
+     • nearby occurrence — fetched live from iNaturalist by the record's GPS
+       (cached per ~cell): the sharper "seen right here" signal, when online.
+   Deliberately RELAXED: a prior only NUDGES ranking (a small multiplicative
+   boost used for sorting), never inflates confidence and never gates a
+   species out — a rare plant you actually said is still fully findable.
+   ============================================================ */
+function speciesKey(name) {
+  const words = (name || "").toLowerCase().replace(/[^a-z\s-]/g, " ").split(/\s+/)
+    .filter(w => w && !RANK_WORDS.has(w) && w !== "x");
+  return words.slice(0, 2).join(" ");
+}
+const PRIOR_STRENGTH = 0.28;   // relaxed: how much the prior can reorder ties
+// Concentric rings (km) for the geographic prior. Broad on purpose — the far
+// ring still includes regional species, they're just weighted down by
+// distance. Works anywhere on Earth (iNaturalist is global); the closeness
+// weight makes likelihood fall off with distance from the record.
+const PRIOR_RINGS_KM = [50, 150, 400];
+const PRIOR_DIST_SCALE = 120;  // higher = gentler distance falloff
+function ringCloseness(km) { return Math.min(1, 1.3 / (1 + km / PRIOR_DIST_SCALE)); } // 50→0.92, 150→0.58, 400→0.30
+const ContextPriors = {
+  enabled: true,
+  freq: null, freqLogMax: 1,          // bundled baseline commonness (by full name), offline fallback
+  nearby: null,                       // { speciesKey: weight 0..1 } distance-graded, or null
+  _cell: null,
+
+  async loadFreq() {
+    try {
+      const r = await fetch("species/frequency-ch.json");
+      const d = await r.json();
+      this.freq = d.freq || {};
+      const max = Object.values(this.freq).reduce((m, c) => c > m ? c : m, 1);
+      this.freqLogMax = Math.log1p(max);
+    } catch { this.freq = {}; }
+  },
+
+  // 0..1 prior weight for a species. The nearby (location) signal is the
+  // primary, global one; the bundled baseline commonness is a weaker fallback
+  // used offline / where no observations are recorded. Take the max so a
+  // species that's actually near you is preferred, without ever penalising one
+  // that isn't.
+  weight(fullName) {
+    if (!this.enabled) return 0;
+    let w = 0;
+    if (this.freq) {
+      const c = this.freq[fullName] || 0;
+      // Baseline is a gentler signal than local presence — cap its reach.
+      if (c > 0) w = 0.7 * (Math.log1p(c) / this.freqLogMax);
+    }
+    if (this.nearby) {
+      const nw = this.nearby[speciesKey(fullName)] || 0;
+      if (nw > w) w = nw;
+    }
+    return w;
+  },
+
+  // Set the active location and (re)load the distance-graded nearby prior for
+  // its cell. Coarse ~0.1° cell so small GPS jitter doesn't refetch; cached in
+  // localStorage so a revisited area keeps working offline.
+  async setLocation(lat, lon) {
+    if (!this.enabled) return;
+    if (lat == null || lon == null || lat === "" || lon === "" || isNaN(+lat) || isNaN(+lon)) return;
+    const cell = (+lat).toFixed(1) + "," + (+lon).toFixed(1);
+    if (cell === this._cell && this.nearby) return;
+    this._cell = cell;
+    const cacheKey = "isurvey.nearby." + cell;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) { this.nearby = JSON.parse(cached); return; }
+    } catch { /* ignore */ }
+
+    // Fetch each ring (closest first); a species keeps the smallest ring it
+    // appears in (= nearest observation band) and the count in that band.
+    const firstRing = {}; // key -> { ring: index, count }
+    let any = false;
+    for (let i = 0; i < PRIOR_RINGS_KM.length; i++) {
+      try {
+        const url = `https://api.inaturalist.org/v1/observations/species_counts?lat=${+lat}&lng=${+lon}&radius=${PRIOR_RINGS_KM[i]}&iconic_taxa=Plantae&per_page=500`;
+        const r = await fetch(url);
+        if (!r.ok) continue;
+        const d = await r.json();
+        for (const res of d.results || []) {
+          const nm = res.taxon && res.taxon.name;
+          if (!nm) continue;
+          const k = speciesKey(nm);
+          if (k && !(k in firstRing)) { firstRing[k] = { ring: i, count: res.count || 0 }; any = true; }
+        }
+      } catch { /* skip this ring */ }
+    }
+    if (!any) return; // offline / API down — baseline frequency still applies
+
+    // Convert to a 0..1 weight: closeness (inverse distance) × a mild
+    // local-abundance factor.
+    let logMax = 0;
+    for (const k in firstRing) { const l = Math.log1p(firstRing[k].count); if (l > logMax) logMax = l; }
+    logMax = logMax || 1;
+    const map = {};
+    for (const k in firstRing) {
+      const { ring, count } = firstRing[k];
+      const cf = 0.55 + 0.45 * (Math.log1p(count) / logMax);
+      map[k] = +(ringCloseness(PRIOR_RINGS_KM[ring]) * cf).toFixed(4);
+    }
+    this.nearby = map;
+    try { localStorage.setItem(cacheKey, JSON.stringify(map)); } catch { /* quota */ }
+  },
+};
+
+/* Latin/scientific-name-tuned phonetic code — not a strict Metaphone port,
+   a consonant-skeleton reduction that is deliberately *accent-invariant*, so
+   the same Latin word lands on the same code whether an English, Italian,
+   German or French speaker said it (and however the recognizer then spelt it).
+   The key moves: normalize digraphs (ph→f, ch→k, sch→s, gn→n, qu→k …); drop
+   silent-across-accents h; map w→v, j→i/s, y→i; and — the accent lever —
+   merge voiced/unvoiced consonant pairs (v/f, b/p, d/t, g/k, z/s), since which
+   member a speaker uses is exactly what varies by accent (German "fulgaris"
+   for "vulgaris", "brunella" for "prunella", etc.). Validated against a
+   battery of real mishearings to lift accent-match margins without collapsing
+   distinct near-neighbour species together. */
 function phoneticCode(word) {
   let w = (word || "").toLowerCase().replace(/[^a-z]/g, "");
   if (!w) return "";
   w = w
+    .replace(/sch/g, "s").replace(/sh/g, "s")
+    .replace(/ph/g, "f").replace(/th/g, "t").replace(/rh/g, "r").replace(/gh/g, "g")
+    .replace(/ch/g, "k").replace(/ck/g, "k")
+    .replace(/qu/g, "k").replace(/q/g, "k")
+    .replace(/x/g, "ks").replace(/gn/g, "n")
     .replace(/ae|oe/g, "e")
-    .replace(/ph/g, "f")
-    .replace(/th/g, "t")
-    .replace(/rh/g, "r")
-    .replace(/ch/g, "k")
-    .replace(/qu/g, "k")
-    .replace(/y/g, "i")
-    .replace(/z/g, "s")
-    .replace(/x/g, "ks")
-    .replace(/c(?=[eiy])/g, "s")
-    .replace(/c/g, "k")
+    .replace(/y/g, "i").replace(/j/g, "i").replace(/w/g, "v").replace(/h/g, "")
+    .replace(/c(?=[ei])/g, "s").replace(/g(?=[ei])/g, "j").replace(/c/g, "k")
+    // voiced/unvoiced merges — accent voicing invariance
+    .replace(/[vf]/g, "f").replace(/[bp]/g, "p").replace(/[dt]/g, "t")
+    .replace(/[gk]/g, "k").replace(/[zs]/g, "s").replace(/j/g, "s")
     .replace(/([a-z])\1+/g, "$1");
   const first = w[0];
   const rest = w.slice(1).replace(/[aeiou]/g, "").replace(/([a-z])\1+/g, "$1");
-  return (first + rest).slice(0, 8);
+  return (first + rest).slice(0, 10);
 }
 
 function levenshtein(a, b) {
@@ -734,10 +854,96 @@ function fuzzyMatchTranscripts(transcripts, limit) {
       const score = scoreTaxonAgainstWords(sp, q.words, q.phon);
       if (score > best) best = score;
     }
-    if (best > 0.15) scored.push({ sp, score: best });
+    if (best > 0.15) {
+      // Context prior nudges the SORT key only — the reported .score stays the
+      // honest acoustic/text match (so confidence/auto-fill isn't inflated by
+      // "this species is common"), while a likelier species is surfaced first
+      // among otherwise-comparable candidates.
+      const rank = best * (1 + PRIOR_STRENGTH * ContextPriors.weight(sp.t));
+      scored.push({ sp, score: best, rank });
+    }
+  }
+  scored.sort((a, b) => b.rank - a.rank);
+  return scored.slice(0, limit);
+}
+
+/* ---- genus-then-epithet matching (for the two-step guided dictation) ------
+   Saying a long binomial in one breath is the hard case for any recognizer;
+   said as two short pieces — genus, pause, epithet — each is far easier to
+   get right. These helpers match each piece independently: the genus against
+   the list of distinct genera, then the epithet against ONLY the species of
+   that genus, so the search space for the second half is a handful of names
+   instead of 4,000. */
+let _generaIndex = null;
+function generaIndex() {
+  if (_generaIndex) return _generaIndex;
+  const m = new Map();
+  for (const sp of Species.all) {
+    const g = sp.t.split(/\s+/)[0];
+    const key = g.toLowerCase();
+    if (!m.has(key)) m.set(key, { genus: g, phon: phoneticCode(key) });
+  }
+  _generaIndex = [...m.values()];
+  return _generaIndex;
+}
+function matchGenus(transcripts, limit) {
+  limit = limit || 5;
+  const qSets = transcripts.map(tokenize).filter(q => q.words.length);
+  if (!qSets.length) return [];
+  const scored = [];
+  for (const { genus, phon: gp } of generaIndex()) {
+    const gw = genus.toLowerCase();
+    let best = 0;
+    for (const q of qSets) {
+      for (let i = 0; i < q.words.length; i++) {
+        const s = wordScore(q.words[i], gw, q.phon[i], gp);
+        if (s > best) best = s;
+      }
+      const concat = q.words.join(""), cp = phoneticCode(concat);
+      const blob = 0.5 * strSim(concat, gw) + 0.5 * strSim(cp, gp);
+      if (blob > best) best = blob;
+    }
+    if (best > 0.3) scored.push({ genus, score: best });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
+}
+// Score the spoken epithet against one species' epithet words only (the genus
+// is already known), so an unspoken genus isn't penalised.
+function scoreEpithet(sp, words, phon) {
+  ensureSpeciesIndexed(sp);
+  const ew = sp._words.slice(1).filter(w => !RANK_WORDS.has(w));
+  if (!ew.length) return 0;
+  const ep = ew.map(phoneticCode);
+  let wi = 0, total = 0;
+  for (let i = 0; i < words.length; i++) {
+    let b = 0, bj = -1;
+    for (let j = wi; j < ew.length; j++) { const s = wordScore(words[i], ew[j], phon[i], ep[j]); if (s > b) { b = s; bj = j; } }
+    total += b; if (bj >= 0) wi = bj + 1;
+  }
+  const align = total / Math.max(words.length, ew.length);
+  const concat = words.join(""), cp = phoneticCode(concat);
+  const et = ew.join(""), etp = phoneticCode(et);
+  const blob = 0.5 * strSim(concat, et) + 0.5 * strSim(cp, etp);
+  return Math.max(align, blob);
+}
+function matchWithinGenus(genus, transcripts, limit) {
+  limit = limit || 6;
+  const gl = genus.toLowerCase();
+  const qSets = transcripts.map(tokenize).filter(q => q.words.length);
+  const scored = [];
+  for (const sp of Species.all) {
+    if (sp.t.toLowerCase().split(/\s+/)[0] !== gl) continue;
+    let best = 0;
+    for (const q of qSets) { const s = scoreEpithet(sp, q.words, q.phon); if (s > best) best = s; }
+    scored.push({ sp, score: best });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+function generaSpecies(genus, limit) {
+  const gl = genus.toLowerCase();
+  return Species.all.filter(sp => sp.t.toLowerCase().split(/\s+/)[0] === gl).slice(0, limit || 8).map(sp => ({ sp, score: 1 }));
 }
 
 /* Segment a transcript into one-or-more species names via dynamic
@@ -857,6 +1063,87 @@ async function runAiDictation(inputEl, menuEl, setStatus, onPick) {
   }
 }
 
+// The device (Web Speech) recognizer transcribes accented Latin far better
+// when told the speaker's actual language, so the one voice-language setting
+// drives BOTH this path and the AI one. Web Speech takes a single BCP-47 tag
+// per session (it can't multiplex languages), so "multilingual" — an AI-only
+// capability — falls back to the device's own locale here.
+const SPEECH_LANG_TAGS = { en: "en-US", it: "it-IT", de: "de-DE", fr: "fr-FR" };
+
+// One-shot device recognition: start listening, resolve with the engine's
+// alternative transcripts on the first result (or [] on silence/timeout).
+// Used by the two-step guided flow, which needs to await one utterance,
+// process it, then await the next.
+function recognizeOnceWebSpeech(lang) {
+  return new Promise((resolve, reject) => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { reject(new Error("speech recognition not available")); return; }
+    const rec = new SR();
+    rec.lang = lang;
+    rec.interimResults = false;
+    rec.maxAlternatives = SPEECH_MAX_ALTERNATIVES;
+    let settled = false;
+    rec.addEventListener("result", e => { if (!settled) { settled = true; resolve(Array.from(e.results[0]).map(a => a.transcript)); } });
+    rec.addEventListener("error", e => { if (!settled) { settled = true; if (e.error === "no-speech" || e.error === "aborted") resolve([]); else reject(new Error(e.error || "speech error")); } });
+    rec.addEventListener("end", () => { if (!settled) { settled = true; resolve([]); } });
+    try { rec.start(); } catch (err) { if (!settled) { settled = true; reject(err); } }
+  });
+}
+
+// Guided two-step dictation: say the genus, then the epithet. Each half is a
+// short, low-ambiguity utterance, and the epithet is matched only within the
+// recognised genus — much more reliable than one long binomial for hard names
+// or strong accents. Uses the device recognizer (the stronger one) in the
+// language chosen in Settings.
+async function twoStepDictation(inputEl, menuEl, setStatus, onPick, btn) {
+  const settings = await Store.getSettings();
+  const lang = deviceSpeechLang(settings);
+  if (btn) btn.classList.add("listening");
+  const finish = () => { if (btn) btn.classList.remove("listening"); };
+  try {
+    setStatus("Step 1 — say the genus…");
+    const gWords = await recognizeOnceWebSpeech(lang);
+    if (!gWords.length) { setStatus("Didn't catch the genus — tap to try again."); finish(); return; }
+    const genera = matchGenus(gWords, 5);
+    if (!genera.length) { setStatus(`Heard "${gWords[0]}" — no matching genus. Tap to retry.`); finish(); return; }
+    const genus = genera[0].genus;
+
+    setStatus(`Genus: ${genus} — step 2, say the species…`);
+    await new Promise(r => setTimeout(r, 350)); // brief gap before re-listening
+    const eWords = await recognizeOnceWebSpeech(lang);
+    finish();
+    if (!eWords.length) {
+      // No epithet heard — offer the genus's species to tap instead.
+      renderVoiceCandidates(menuEl, generaSpecies(genus, 8), sp => { onPick(sp); setStatus(""); });
+      setStatus(`Genus ${genus} — pick the species:`);
+      return;
+    }
+    const matches = matchWithinGenus(genus, eWords, 6).filter(m => m.score > 0.2);
+    if (!matches.length) {
+      renderVoiceCandidates(menuEl, generaSpecies(genus, 8), sp => { onPick(sp); setStatus(""); });
+      setStatus(`Heard "${eWords[0]}" — pick a ${genus} species:`);
+      return;
+    }
+    const top = matches[0].sp;
+    inputEl.value = top.t;
+    inputEl.dispatchEvent(new Event("input"));
+    inputEl.focus();
+    setStatus(`${genus} → ${top.t}`);
+    renderVoiceCandidates(menuEl, matches.slice(0, 5), sp => { onPick(sp); setStatus(""); });
+  } catch (e) {
+    finish();
+    console.error(e);
+    setStatus("Two-step dictation failed: " + (e.message || e));
+  }
+}
+
+function deviceSpeechLang(settings) {
+  return SPEECH_LANG_TAGS[settings && settings.aiVoiceLang] || navigator.language || "en-US";
+}
+// More alternatives = more chances the strong matcher finds the true name
+// behind the recognizer's language-model "snap" to common words.
+const SPEECH_MAX_ALTERNATIVES = 12;
+
 function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return;
@@ -864,7 +1151,7 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
   const rec = new SR();
   rec.lang = navigator.language || "en-US";
   rec.interimResults = false;
-  rec.maxAlternatives = 6;
+  rec.maxAlternatives = SPEECH_MAX_ALTERNATIVES;
   let listening = false;
   let retries = 0;
   let manualStop = false;
@@ -896,6 +1183,7 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
     if (listening) { manualStop = true; rec.stop(); setStatus(""); return; }
     retries = 0;
     manualStop = false;
+    rec.lang = deviceSpeechLang(settings);
     setStatus("Listening…");
     startListening();
   });
@@ -1049,7 +1337,7 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
   const rec = new SR();
   rec.lang = navigator.language || "en-US";
   rec.interimResults = false;
-  rec.maxAlternatives = 6;
+  rec.maxAlternatives = SPEECH_MAX_ALTERNATIVES;
   // Deliberately NOT continuous: Chrome's continuous mode batches speech
   // into fewer, longer results with looser endpointing, which is exactly
   // what causes several species said in sequence to get glued into one
@@ -1121,6 +1409,7 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
       return;
     }
     active = true;
+    rec.lang = deviceSpeechLang(settings);
     setBtnState();
     setStatus("Listening — say each species as you spot it…");
     startSession();
@@ -1230,21 +1519,25 @@ function wireInfoModal() {
     const topic = INFO_TOPICS[dot.getAttribute("data-info")];
     if (topic) openInfoModal(topic.title, topic.html);
   };
+  // Capture phase (third arg true) so this runs BEFORE the click reaches the
+  // enclosing button/summary's own bubbling handler — otherwise stopPropagation
+  // is too late and tapping a dot inside e.g. the GPS or two-step button would
+  // ALSO fire that button. stopImmediatePropagation prevents the host control.
   document.addEventListener("click", e => {
-    const dot = e.target.closest(".info-dot[data-info]");
+    const dot = e.target.closest && e.target.closest(".info-dot[data-info]");
     if (!dot) return;
-    e.preventDefault(); e.stopPropagation();
+    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
     openDotTopic(dot);
-  });
+  }, true);
   // The dots are spans with role=button (so they can nest legally inside real
   // buttons/summaries) — wire keyboard activation to match a real button.
   document.addEventListener("keydown", e => {
     if (e.key !== "Enter" && e.key !== " ") return;
     const dot = e.target.closest && e.target.closest(".info-dot[data-info]");
     if (!dot) return;
-    e.preventDefault(); e.stopPropagation();
+    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
     openDotTopic(dot);
-  });
+  }, true);
 }
 
 /* Inline-help content for the (i) dots scattered through the editors. Kept
@@ -1252,6 +1545,56 @@ function wireInfoModal() {
    appears, and so the wording lives next to the code it describes. Small SVGs
    use currentColor so they follow the light/dark theme. */
 const INFO_TOPICS = {
+  contextPriors: {
+    title: "Likely-species priors",
+    html: `
+      <p>At any spot, only a fraction of the species are actually plausible.
+      When it's matching what you said, this leans toward the likely ones:</p>
+      <p>• <strong>Near your location</strong> (the main signal — works anywhere
+      in the world). When online with GPS, it looks up which species have been
+      recorded around you via iNaturalist, across a wide area, and weights each
+      by <em>how close</em> its records are — likelihood falls off with
+      distance, but far-away regional species are still included, just lower.
+      Cached per area, so a place you've visited keeps working offline.</p>
+      <p>• <strong>General commonness</strong> — a bundled fallback for when
+      you're offline or a species isn't recorded nearby, so a spoken "Achillea"
+      still leans to the common <em>A. millefolium</em> over rare congeners.</p>
+      <p><strong>Broad and relaxed on purpose:</strong> the area is wide, not a
+      tight bubble, and priors only <em>nudge the order</em> of candidates —
+      they never inflate confidence and never hide a species, so a rare plant
+      you genuinely said is still found.</p>`,
+  },
+  twoStep: {
+    title: "Two-step dictation (genus → species)",
+    html: `
+      <p>Saying a whole binomial in one breath is the hardest thing for any
+      speech engine to get right. This splits it into two short, easy pieces:</p>
+      <p><strong>1.</strong> Tap the button and say just the <strong>genus</strong>
+      (e.g. "Ranunculus"). It's short and distinctive, so it's recognised
+      reliably.</p>
+      <p><strong>2.</strong> When prompted, say just the <strong>species
+      epithet</strong> (e.g. "acris"). It's matched against <em>only</em> the
+      species of that genus — a handful of names instead of thousands — so even
+      a rough pronunciation lands on the right one.</p>
+      <p>Great for long or unfamiliar names and for strong accents. Uses your
+      chosen recognition language (Settings).</p>`,
+  },
+  voiceLang: {
+    title: "Recognition language / accent",
+    html: `
+      <p>The speech engine transcribes a Latin name much more faithfully when it
+      knows which language you're pronouncing it in — the same word sounds
+      different from an English, Italian, German or French mouth, and telling it
+      your language is the single biggest thing you can do for accuracy.</p>
+      <p><strong>Set this to your own accent</strong> (Italian / German / French /
+      English) if you can — it's faster and more accurate than guessing.</p>
+      <p><strong>Auto / multilingual</strong>: standard dictation follows your
+      device's language; the AI option (if enabled) actually listens in all four
+      languages at once and keeps whichever fits best — most robust for mixed
+      teams or unknown accents, but a little slower.</p>
+      <p>This setting applies to <em>both</em> standard dictation and the AI
+      matching option.</p>`,
+  },
   voiceModes: {
     title: "Voice logging & dictation",
     html: `
@@ -1606,6 +1949,7 @@ const ReleveEditor = {
     $("#releveGpsStatus").textContent = "";
     this._map = this._map || createLocationMap("releveMap", "releveMapWrap");
     this._map.update(r.lat, r.lon, r.acc);
+    ContextPriors.setLocation(r.lat, r.lon);
     this.renderAssessmentMethod();
     this.renderNested();
     this.renderSpecies();
@@ -1824,6 +2168,7 @@ const ObservationEditor = {
     $("#observationGpsStatus").textContent = "";
     this._map = this._map || createLocationMap("observationMap", "observationMapWrap");
     this._map.update(s.lat, s.lon);
+    ContextPriors.setLocation(s.lat, s.lon);
     this.renderTaxonChip();
     await renderPhotoGrid(s.photoIds, $("#observationPhotos"));
   },
@@ -2043,6 +2388,7 @@ const TransectEditor = {
     $("#transectVoiceLogStatus").textContent = "";
     this._map = this._map || createLocationMap("transectMap", "transectMapWrap");
     this._map.update(t.lat, t.lon, t.acc);
+    ContextPriors.setLocation(t.lat, t.lon);
     this.renderSpecies();
   },
 
@@ -2417,6 +2763,7 @@ const EdggEditor = {
     $("#edggNwGpsStatus").textContent = ""; $("#edggSeGpsStatus").textContent = "";
     this._mapNw = this._mapNw || createLocationMap("edggNwMap", "edggNwMapWrap");
     this._mapNw.update(e.nwLat, e.nwLon, e.nwAcc);
+    ContextPriors.setLocation(e.nwLat, e.nwLon);
     this._mapSe = this._mapSe || createLocationMap("edggSeMap", "edggSeMapWrap");
     this._mapSe.update(e.seLat, e.seLon, e.seAcc);
 
@@ -2752,6 +3099,7 @@ const AiVoice = {
       }
       const settings = await Store.getSettings();
       mod.setQuality(settings.aiVoiceQuality || "accurate");
+      mod.setLanguage(settings.aiVoiceLang || "multi");
       this.setStatus("Preparing…");
       await mod.loadModel(p => {
         if (p && p.status === "progress" && p.total) {
@@ -2778,6 +3126,7 @@ const AiVoice = {
     const settings = await Store.getSettings();
     $("#aiVoiceEnabled").checked = !!settings.aiVoiceEnabled;
     if ($("#aiVoiceQuality")) $("#aiVoiceQuality").value = settings.aiVoiceQuality || "accurate";
+    if ($("#aiVoiceLang")) $("#aiVoiceLang").value = settings.aiVoiceLang || "multi";
     if (!settings.aiVoiceEnabled) { this.setStatus(""); $("#aiVoiceDownloadBtn").hidden = true; return; }
     if (this.mod && this.mod.isLoaded()) { this.setStatus("Ready — on-device voice matching is active."); return; }
     if (this.error) { this.setStatus(this.error); $("#aiVoiceDownloadBtn").hidden = false; return; }
@@ -2792,6 +3141,7 @@ const Settings = {
     $("#defaultScaleSelect").value = settings.defaultScale || "bb";
     $("#gpsThresholdInput").value = settings.gpsThreshold || 10;
     $("#voiceSpeakFeedback").checked = settings.voiceSpeakFeedback !== false;
+    $("#contextPriors").checked = settings.contextPriors !== false;
     $("#voiceReviewCheckpointInput").value = settings.voiceReviewCheckpoint || 30;
     await AiVoice.refreshStatus();
 
@@ -2970,7 +3320,12 @@ function wireHome() {
    and GPS-capture updates alike), and fix Leaflet's sizing when its
    <details> fold is opened after being hidden. */
 function wireLiveMapUpdates(latEl, lonEl, getMap, accEl) {
-  const update = () => { const m = getMap(); if (m) m.update(latEl.value, lonEl.value, accEl ? accEl.value : null); };
+  const update = () => {
+    const m = getMap(); if (m) m.update(latEl.value, lonEl.value, accEl ? accEl.value : null);
+    // Refresh the nearby-species prior for this location (fires on GPS capture,
+    // which dispatches input events, and on manual coordinate edits).
+    ContextPriors.setLocation(latEl.value, lonEl.value);
+  };
   latEl.addEventListener("input", update);
   lonEl.addEventListener("input", update);
   if (accEl) accEl.addEventListener("input", update);
@@ -3041,6 +3396,15 @@ function wireObservationEditor() {
   wireLiveMapUpdates($("#observationLat"), $("#observationLon"), () => ObservationEditor._map);
   wireAutocomplete($("#observationTaxonInput"), $("#observationAcMenu"), sp => ObservationEditor.setTaxon(sp));
   wireDictation($("#observationDictateBtn"), $("#observationTaxonInput"), $("#observationAcMenu"), $("#observationDictateStatus"), sp => ObservationEditor.setTaxon(sp));
+  // Two-step guided dictation (genus → species) — only where the device
+  // recognizer exists, since it drives the guided flow.
+  if (window.SpeechRecognition || window.webkitSpeechRecognition) {
+    const tsBtn = $("#observationTwoStepBtn");
+    tsBtn.hidden = false;
+    tsBtn.addEventListener("click", () => twoStepDictation(
+      $("#observationTaxonInput"), $("#observationAcMenu"), t => { $("#observationDictateStatus").textContent = t || ""; },
+      sp => ObservationEditor.setTaxon(sp), tsBtn));
+  }
   $("#observationPhotoInput").addEventListener("change", e => addPhotosFromInput(e.target, ObservationEditor.current.photoIds, $("#observationPhotos")));
   $("#observationSaveBtn").addEventListener("click", () => ObservationEditor.save());
   $("#observationDeleteBtn").addEventListener("click", () => ObservationEditor.remove());
@@ -3107,6 +3471,13 @@ function wireSettings() {
     s.voiceSpeakFeedback = $("#voiceSpeakFeedback").checked;
     await Store.saveSettings(s);
   });
+  $("#contextPriors").addEventListener("change", async () => {
+    const s = await Store.getSettings();
+    s.contextPriors = $("#contextPriors").checked;
+    await Store.saveSettings(s);
+    ContextPriors.enabled = s.contextPriors;
+    if (s.contextPriors && !ContextPriors.freq) ContextPriors.loadFreq();
+  });
   $("#voiceReviewCheckpointInput").addEventListener("change", async () => {
     const s = await Store.getSettings();
     s.voiceReviewCheckpoint = Math.max(5, Number($("#voiceReviewCheckpointInput").value) || 30);
@@ -3120,6 +3491,13 @@ function wireSettings() {
     await AiVoice.refreshStatus();
   });
   $("#aiVoiceDownloadBtn").addEventListener("click", () => AiVoice.ensureLoaded());
+  $("#aiVoiceLang").addEventListener("change", async () => {
+    const s = await Store.getSettings();
+    s.aiVoiceLang = $("#aiVoiceLang").value;
+    await Store.saveSettings(s);
+    // No reload needed — language only changes which decoder prompt is used.
+    if (AiVoice.mod && AiVoice.mod.setLanguage) AiVoice.mod.setLanguage(s.aiVoiceLang);
+  });
   $("#aiVoiceQuality").addEventListener("change", async () => {
     const s = await Store.getSettings();
     s.aiVoiceQuality = $("#aiVoiceQuality").value;
@@ -3168,10 +3546,14 @@ async function init() {
     console.error(e);
   }
   await Home.refresh();
+  const settings = await Store.getSettings();
+  // Context priors: load the bundled national frequency table (always on if
+  // present) so common-species ranking works from the first dictation.
+  ContextPriors.enabled = settings.contextPriors !== false;
+  if (ContextPriors.enabled) ContextPriors.loadFreq();
   // If AI-enhanced voice matching was already enabled in a previous session,
   // start warming it up now (from browser cache — no re-download) instead of
   // only on the next Settings visit, so it's ready by the time it's needed.
-  const settings = await Store.getSettings();
   if (settings.aiVoiceEnabled) AiVoice.ensureLoaded();
 }
 

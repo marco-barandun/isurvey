@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="styles.css?v=24">
+  <link rel="stylesheet" href="styles.css?v=30">
   <link rel="stylesheet" href="vendor/leaflet.css">
   <script>
     (() => { try { const t = localStorage.getItem("isurvey.theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch {} })();
@@ -307,6 +307,11 @@
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
             </button>
           </div>
+          <button type="button" id="observationTwoStepBtn" class="btn btn-ghost full" style="margin-top:6px" hidden>
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            Dictate in two steps (genus → species)
+            <span class="info-dot" role="button" tabindex="0" data-info="twoStep" aria-label="About two-step dictation">i</span>
+          </button>
           <div id="observationDictateStatus" class="hint"></div>
           <div id="observationAcMenu" class="ac-menu"></div>
         </div>
@@ -943,6 +948,19 @@
         <input type="number" id="voiceReviewCheckpointInput" class="input" min="5" max="200" step="5">
         <p class="hint" style="margin:0">While voice logging a transect, you get a gentle (non-interrupting) nudge every time this many taxa have been logged, as a natural point to open <em>Review &amp; approve</em>. You can always review sooner, or wait until the end — this is just a reminder.</p>
 
+        <label class="field-label" for="aiVoiceLang" style="margin-top:14px">Recognition language / accent <span class="info-dot" role="button" tabindex="0" data-info="voiceLang" aria-label="About recognition language">i</span></label>
+        <select id="aiVoiceLang" class="input">
+          <option value="multi">Auto / multilingual</option>
+          <option value="en">English</option>
+          <option value="it">Italian</option>
+          <option value="de">German</option>
+          <option value="fr">French</option>
+        </select>
+        <p class="hint" style="margin:4px 0 0"><strong>Set this to your accent.</strong> Latin names are recognised far better when the speech engine knows which language you're pronouncing them in — this is the single biggest thing you can do for accuracy if you speak with an Italian, German or French accent. Applies to both standard dictation and the AI option below.</p>
+
+        <label class="check" style="margin-top:14px"><input type="checkbox" id="contextPriors"><span>Prefer species that are likely here <span class="info-dot" role="button" tabindex="0" data-info="contextPriors" aria-label="About location &amp; frequency priors">i</span></span></label>
+        <p class="hint" style="margin:0">When matching a spoken name, favours species actually recorded near your location — anywhere in the world, weighted by distance across a wide area (with a bundled general-commonness fallback for offline). A likely plant wins over a rare look-alike. Relaxed: it only nudges the ranking, never hides anything.</p>
+
         <h4>AI-enhanced voice matching <span class="tag">experimental</span></h4>
         <label class="check"><input type="checkbox" id="aiVoiceEnabled"><span>Use on-device Whisper for species dictation</span></label>
         <p class="hint" style="margin:0">Instead of trusting a generic dictation engine's guess at what you said, this records your voice, runs it through an on-device speech model, and directly scores the <strong>audio</strong> against every plausible species name in the checklist — picking whichever name the recording actually sounds most like, rather than matching text after the fact. Meant to noticeably outperform standard dictation on Latin names it was never trained on.</p>
@@ -998,7 +1016,7 @@
     </button>
   </nav>
 
-  <script src="app.js?v=24"></script>
+  <script src="app.js?v=30"></script>
   <script>
     (() => {
       const root = document.documentElement;

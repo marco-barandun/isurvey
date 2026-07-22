@@ -42,24 +42,36 @@ function setQuality(q) {
   MODEL_ID = QUALITY_MODELS[q] || QUALITY_MODELS.accurate;
 }
 
-// Beam width for the free transcript. Beam search yields a better single
-// transcript than greedy on the unusual multi-syllable words this app lives
-// on (worth the extra decode time), which in turn means the true species is
-// more likely to land in the text shortlist that gets audio-rescored. (This
-// pinned transformers.js build only ever returns the single best beam even
-// when more are requested, so the shortlist is built from that one transcript
-// plus the phonetic/fuzzy expansion the matcher already does — the heavy
-// lifting for accuracy is the audio rescoring + acoustic/text blend, not
-// transcript diversity.)
+// Beam width used when transcribing under a SINGLE language (better quality
+// than greedy for that one pass). In multilingual mode each language is
+// decoded greedily instead — the diversity across languages already does the
+// job of a beam, at a fraction of the cost.
 const BEAM_WIDTH = 4;
 
-// Dictation language for both the free transcript and every candidate score
-// — fixed rather than auto-detected. Whisper's own language auto-detection
-// needs its own extra forward pass, and more importantly the SAME language
-// must be used for the free transcript and every candidate's teacher-forced
-// score for their log-likelihoods to be comparable. English is a reasonable
-// default for Latin binomial dictation; could become a Settings option later.
-const LANG = "en";
+// --- Recognition languages ------------------------------------------------
+// The single biggest lever for accent robustness. A Latin binomial spoken by
+// an Italian, German or French botanist is transcribed FAR more faithfully
+// when Whisper decodes it under that speaker's own language than through an
+// English lens — and the teacher-forced acoustic score is only meaningful
+// when computed under the same language the utterance was produced in. So
+// recognition can run under one chosen language, or "multilingual": decode
+// the utterance under several languages at once, union all their transcripts
+// into the shortlist (recall), and rescore every candidate under each
+// language taking the best (the acoustic match then reflects whatever
+// language the speaker's pronunciation is actually closest to).
+const SUPPORTED_LANGS = ["en", "it", "de", "fr"];
+const LANG_SETS = {
+  multi: ["en", "it", "de", "fr"],
+  en: ["en"], it: ["it"], de: ["de"], fr: ["fr"],
+};
+let LANG_PREF = "multi";
+
+// Set which language(s) recognition runs under. Safe to call any time — it
+// only changes which decoder prompt tokens are used, no model reload needed.
+function setLanguage(pref) {
+  LANG_PREF = LANG_SETS[pref] ? pref : "multi";
+}
+function activeLangs() { return LANG_SETS[LANG_PREF] || LANG_SETS.multi; }
 
 const state = {
   loaded: false,
@@ -67,8 +79,8 @@ const state = {
   tokenizer: null,
   processor: null,
   model: null,
-  promptIds: null, // [<|startoftranscript|>, <|LANG|>, <|transcribe|>, <|notimestamps|>]
-  dims: null,      // { layers, heads, headDim } — read from the loaded model's config
+  promptIdsByLang: null, // { en:[sot,<|en|>,transcribe,notimestamps], it:[…], … }
+  dims: null,            // { layers, heads, headDim } — from the loaded model's config
 };
 
 async function loadModel(onProgress) {
@@ -86,7 +98,12 @@ async function loadModel(onProgress) {
     // or not. "quantized: true" is this older version's loading option.
     state.model = await WhisperForConditionalGeneration.from_pretrained(MODEL_ID, { ...opts, quantized: true });
     const tok = s => state.tokenizer.model.tokens_to_ids.get(s);
-    state.promptIds = [tok("<|startoftranscript|>"), tok(`<|${LANG}|>`), tok("<|transcribe|>"), tok("<|notimestamps|>")];
+    // Precompute the decoder prompt for every supported language once, so both
+    // transcription and teacher-forced scoring can switch language for free.
+    state.promptIdsByLang = {};
+    for (const lang of SUPPORTED_LANGS) {
+      state.promptIdsByLang[lang] = [tok("<|startoftranscript|>"), tok(`<|${lang}|>`), tok("<|transcribe|>"), tok("<|notimestamps|>")];
+    }
     // Decoder KV-cache placeholder tensors (below) must match THIS model's
     // shape, which differs by size (tiny: 4 layers / 6 heads; base: 6 / 8),
     // so read it from the config instead of hard-coding one model's numbers.
@@ -163,10 +180,22 @@ async function blobToPCM16k(blob) {
 // API results; it does NOT split two names said back-to-back with too
 // short a pause (no equivalent of the text-based DP segmenter used for
 // that case in the Web Speech path) — a known, accepted gap for now.
-const VAD_THRESHOLD = 0.02;     // RMS amplitude (0–1) treated as "speaking"
-const VAD_SILENCE_MS = 600;     // sustained silence to end an utterance
+// Voice-activity thresholds are set RELATIVE to the measured ambient noise
+// floor rather than a fixed value, so the same code works in a still room and
+// in wind/traffic: at startup it samples the background for a moment to learn
+// the floor, then keeps adapting it slowly whenever no one's talking. Speech
+// has to rise clearly above that floor to start a segment (VAD_FLOOR_MARGIN),
+// and only has to stay a bit above it to keep going (hysteresis), so a name
+// isn't chopped mid-word by a brief dip.
+const VAD_FLOOR_MARGIN = 2.6;   // speech must exceed noiseFloor × this to START
+const VAD_HYSTERESIS = 0.55;    // ...and stay above START × this to CONTINUE
+const VAD_MIN_THRESH = 0.014;   // floor on the start threshold (very quiet rooms)
+const VAD_MAX_THRESH = 0.16;    // ceiling (so loud wind can't disable detection entirely)
+const VAD_FLOOR_EMA = 0.05;     // how fast the noise floor tracks changing ambient
+const VAD_CALIB_MS = 500;       // initial ambient-sampling window
+const VAD_SILENCE_MS = 600;     // sustained silence (below stop threshold) to end an utterance
 const VAD_MIN_SPEECH_MS = 200;  // shorter blips are discarded as noise
-const VAD_MAX_SPEECH_MS = 8000; // force-cut a runaway segment (e.g. wind noise)
+const VAD_MAX_SPEECH_MS = 8000; // force-cut a runaway segment (e.g. steady wind)
 const VAD_POLL_MS = 100;
 
 async function startContinuousCapture(onSegment) {
@@ -180,6 +209,10 @@ async function startContinuousCapture(onSegment) {
   const timeData = new Uint8Array(analyser.fftSize);
 
   let recorder = null, chunks = [], speaking = false, speechStartAt = 0, silenceStartAt = 0;
+  let noiseFloor = VAD_MIN_THRESH / VAD_FLOOR_MARGIN;
+  const calibSamples = [];
+  const calibStart = Date.now();
+  let calibrated = false;
 
   function rmsLevel() {
     analyser.getByteTimeDomainData(timeData);
@@ -187,6 +220,7 @@ async function startContinuousCapture(onSegment) {
     for (let i = 0; i < timeData.length; i++) { const v = (timeData[i] - 128) / 128; sumSq += v * v; }
     return Math.sqrt(sumSq / timeData.length);
   }
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
   function beginSegment() {
     chunks = [];
@@ -211,13 +245,36 @@ async function startContinuousCapture(onSegment) {
 
   const intervalId = setInterval(() => {
     const level = rmsLevel(), now = Date.now();
-    if (level > VAD_THRESHOLD) {
-      silenceStartAt = 0;
-      if (!speaking) beginSegment();
-      else if (now - speechStartAt > VAD_MAX_SPEECH_MS) endSegment();
-    } else if (speaking) {
-      if (!silenceStartAt) silenceStartAt = now;
-      else if (now - silenceStartAt >= VAD_SILENCE_MS) endSegment();
+
+    // Learn the ambient floor from the opening window (a low percentile, so a
+    // stray sound during calibration doesn't inflate it), then keep tracking.
+    if (!calibrated) {
+      calibSamples.push(level);
+      if (now - calibStart >= VAD_CALIB_MS) {
+        const sorted = calibSamples.slice().sort((a, b) => a - b);
+        noiseFloor = sorted[Math.floor(sorted.length * 0.3)] || noiseFloor;
+        calibrated = true;
+      }
+      return; // don't detect speech until the floor is known
+    }
+
+    const startThresh = clamp(noiseFloor * VAD_FLOOR_MARGIN, VAD_MIN_THRESH, VAD_MAX_THRESH);
+    const stopThresh = startThresh * VAD_HYSTERESIS;
+
+    if (!speaking) {
+      // Adapt the floor toward the current quiet level (only while it IS quiet,
+      // so rising speech never drags the floor up with it).
+      if (level < startThresh) noiseFloor = noiseFloor * (1 - VAD_FLOOR_EMA) + level * VAD_FLOOR_EMA;
+      if (level > startThresh) beginSegment();
+    } else {
+      if (level > stopThresh) {
+        silenceStartAt = 0;
+        if (now - speechStartAt > VAD_MAX_SPEECH_MS) endSegment();
+      } else if (!silenceStartAt) {
+        silenceStartAt = now;
+      } else if (now - silenceStartAt >= VAD_SILENCE_MS) {
+        endSegment();
+      }
     }
   }, VAD_POLL_MS);
 
@@ -244,21 +301,41 @@ async function runEncoder(inputFeatures) {
   return out.last_hidden_state;
 }
 
-// Decode the free transcript for one utterance via beam search. A species
-// name is short, so max_new_tokens is kept tight (faster, and it can't run
-// off into a sentence). Returned as a one-element array so callers can treat
-// it uniformly as a set of shortlist seeds.
-async function decodeHypotheses(inputFeatures) {
+// Whisper reliably hallucinates the same handful of throwaway phrases on
+// short, quiet or breath-only clips (exactly what a mic picks up between
+// species in a field) — subtitle credits, "thank you", music/applause tags,
+// bare punctuation. Left in the shortlist these either add a junk species or
+// crowd out the real one, so they're dropped before matching. Kept
+// deliberately tight so it can't swallow a real (short) genus.
+const HALLUCINATION_RE = new RegExp(
+  "^(you|thank you|thanks( for watching)?|bye|okay|ok|so|uh|um|hmm|mm|" +
+  "music|applause|silence|laughter|noise|blank_audio|inaudible|" +
+  "subtitles.*|amara\\.org|transcription.*|subscribe.*|the end|end)" +
+  "[.!?…]*$", "i");
+function isJunk(text) {
+  const s = (text || "").trim();
+  if (s.length < 2) return true;
+  if (!/[a-zA-Z]/.test(s)) return true;                 // punctuation / music symbols only
+  if (/^\[.*\]$/.test(s) || /^\(.*\)$/.test(s)) return true; // "[MUSIC]", "(wind)"
+  if (HALLUCINATION_RE.test(s)) return true;
+  return false;
+}
+
+// Decode the free transcript for one utterance under one language. Species
+// names are short, so max_new_tokens stays tight (faster, can't run off into
+// a sentence). `beams` = 1 (greedy) in multilingual mode where the diversity
+// comes from the languages themselves; the single-language path uses a wider
+// beam for a better one-shot transcript.
+async function decodeUnder(inputFeatures, lang, beams) {
   const out = await state.model.generate({
     input_features: inputFeatures,
-    language: LANG,
+    language: lang,
     task: "transcribe",
-    max_new_tokens: 32,
-    num_beams: BEAM_WIDTH,
+    max_new_tokens: 28,
+    num_beams: beams,
     num_return_sequences: 1,
   });
-  const text = (state.tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || "").trim();
-  return [text];
+  return (state.tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || "").trim();
 }
 
 // One decoder forward pass over prompt + candidate + <|endoftext|>, teacher-
@@ -288,17 +365,20 @@ function decoderInputsFor(seq, encoderHidden) {
 }
 
 // Teacher-forced length-normalized log-likelihood of one candidate string
-// given the audio — "how well does this recording match exactly this name,"
-// scored directly from the acoustic model rather than from text similarity.
-async function scoreCandidate(encoderHidden, candidateText) {
+// given the audio, computed UNDER a specific language prompt — "how well does
+// this recording match exactly this name, pronounced as this language would."
+// The same name scores differently under <|it|> vs <|en|>, which is exactly
+// how accent robustness falls out: the speaker's real language wins.
+async function scoreCandidateUnder(encoderHidden, candidateText, lang) {
   const eot = state.tokenizer.model.tokens_to_ids.get("<|endoftext|>");
   const candidateIds = state.tokenizer.encode(candidateText, { add_special_tokens: false });
   const targets = [...candidateIds, eot];
-  const seq = [...state.promptIds, ...targets];
+  const promptIds = state.promptIdsByLang[lang];
+  const seq = [...promptIds, ...targets];
 
   const { logits } = await state.model.sessions.decoder_model_merged.run(decoderInputsFor(seq, encoderHidden));
   const data = logits.data, vocab = logits.dims[logits.dims.length - 1];
-  const startAt = state.promptIds.length - 1; // position predicting the first real token
+  const startAt = promptIds.length - 1; // position predicting the first real token
   let logProb = 0;
   for (let k = 0; k < targets.length; k++) {
     const row = data.subarray((startAt + k) * vocab, (startAt + k + 1) * vocab);
@@ -322,22 +402,40 @@ async function transcribeAudio(pcm16k) {
   // reentrancy) — processed once, then the two model passes run in sequence.
   const { input_features } = await state.processor(pcm16k);
   const encoderHidden = await runEncoder(input_features);
-  const hypotheses = await decodeHypotheses(input_features);
-  // `transcript` is the display/status string; `hypotheses` is the (currently
-  // single-element) set of seeds the caller feeds to its fuzzy shortlist — an
-  // array so the shortlist step stays identical if multi-hypothesis decoding
-  // becomes available in a future library version.
-  return { transcript: hypotheses[0], hypotheses, encoderHandle: encoderHidden };
+  // Decode under each active language and union the transcripts (de-duped,
+  // junk dropped). Multiple languages → greedy per language (diversity comes
+  // from the languages); a single language → one wider-beam pass.
+  const langs = activeLangs();
+  const beams = langs.length > 1 ? 1 : BEAM_WIDTH;
+  const seen = new Set(), hypotheses = [];
+  for (const lang of langs) {
+    let text;
+    try { text = await decodeUnder(input_features, lang, beams); }
+    catch { continue; }
+    if (isJunk(text)) continue;
+    const key = text.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); hypotheses.push(text); }
+  }
+  // `transcript` is the display/status string (first surviving hypothesis, or
+  // empty if everything was junk); `hypotheses` seeds the caller's shortlist.
+  return { transcript: hypotheses[0] || "", hypotheses, encoderHandle: encoderHidden };
 }
 
 // Step 2: rescore a shortlist of candidate taxon names against the audio
-// behind the given encoderHandle (from transcribeAudio above). Returns the
-// candidates ranked by audio-conditioned score (higher = better match).
+// behind the given encoderHandle. Each candidate is scored under every active
+// language and keeps its best (max) — so the acoustic match reflects whichever
+// language the speaker's pronunciation is actually closest to. Returns the
+// candidates ranked by that best audio-conditioned score.
 async function rescoreCandidates(encoderHandle, candidateTexts) {
+  const langs = activeLangs();
   const ranked = [];
   for (const text of candidateTexts) {
-    const score = await scoreCandidate(encoderHandle, text);
-    ranked.push({ text, score });
+    let best = -Infinity;
+    for (const lang of langs) {
+      const s = await scoreCandidateUnder(encoderHandle, text, lang);
+      if (s > best) best = s;
+    }
+    ranked.push({ text, score: best });
   }
   ranked.sort((a, b) => b.score - a.score);
   return ranked;
@@ -347,6 +445,7 @@ window.WhisperVoice = {
   isSupported,
   isLoaded: () => state.loaded,
   setQuality,
+  setLanguage,
   loadModel,
   startRecording,
   stopRecording,

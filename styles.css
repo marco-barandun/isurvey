@@ -333,7 +333,12 @@ textarea.input { resize: vertical; }
   background: linear-gradient(to top, var(--ground) 60%, transparent);
 }
 
-.fold { border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--surface); margin-bottom: 10px; overflow: hidden; }
+/* NB: no `overflow: hidden` here — it would clip the species/habitat
+   autocomplete dropdown (position:absolute) whenever the fold is shorter than
+   the menu, e.g. a fresh relevé with an empty list, making suggestions appear
+   not to pop up at all. The rounded corners sit at the summary (no background)
+   and the fold-body's bottom padding, so nothing needs clipping. */
+.fold { border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--surface); margin-bottom: 10px; }
 .fold summary {
   padding: 12px 14px; font-weight: 700; font-size: 14px; cursor: pointer; list-style: none;
   display: flex; align-items: center; gap: 8px;

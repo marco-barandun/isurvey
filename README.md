@@ -378,6 +378,30 @@ Turn off spoken confirmations in **Settings → Voice logging** if you'd rather
 work in silence. In a relevé this just flags the entry `unconfirmed`; in a
 transect, see below — every entry carries a real certainty score.
 
+**Ignoring conversation.** Continuous logging listens the whole time you're
+walking, so it has to tell a species call from talking to a colleague. Two
+guards do that, both calibrated by measurement against this checklist:
+
+- **A match floor of 0.62.** Genuinely spoken names — including heavily
+  accented mis-transcriptions like "brunella fulgaris" or "tactilis
+  klomerata" — score 0.75–1.00, while ordinary field speech ("stop recording
+  now", "did you write that down") tops out around 0.58. The floor sits in
+  that gap, so conversation no longer lands on a wrong species.
+- **A "does this even look like a name" test** on the fallback that records
+  unmatched speech as typed: a Latin binomial never contains everyday function
+  words ("the", "you", "next", "okay") or filler sounds ("mm", "uh"), and is at
+  most four words with at least one substantial one. Anything failing that is
+  treated as conversation and silently ignored rather than logged as junk.
+
+On a mixed test session, 18/18 conversational phrases are now ignored (all 18
+previously became entries needing manual deletion), while 0/16 genuine
+utterances were lost.
+
+**Exactly-spoken names are never second-guessed.** A match at 0.97 or above is
+the taxon name itself, so it's accepted without the runner-up margin test —
+otherwise a perfectly clear "Trifolium repens" would be flagged every time
+purely because *Trifolium rubens* exists and sounds close.
+
 **Species not in the checklist**: voice logging doesn't fight you if what you
 said isn't in the bundled taxon list — rather than nagging you to repeat
 indefinitely, anything with real content but no plausible match is added

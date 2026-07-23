@@ -1111,8 +1111,42 @@ function renderVoiceCandidates(menuEl, matches, onPick) {
 }
 
 const VOICE_HIGH_CONF = 0.72;
-const VOICE_LOW_CONF = 0.40;
+/* Floor for accepting a match as a species at all. Measured on this checklist:
+   genuinely-spoken names — including heavily accented mis-transcriptions like
+   "brunella fulgaris" / "tactilis klomerata" — score 0.75–1.00, while ordinary
+   field conversation ("stop recording now", "did you write that down") tops out
+   around 0.58. A floor of 0.62 sits in that gap, so chatter no longer maps onto
+   a wrong species while every genuine utterance still lands. */
+const VOICE_LOW_CONF = 0.62;
+/* At/above this the transcript is effectively the taxon name itself, so it's
+   accepted without the runner-up margin test below — otherwise a perfectly
+   spoken name with a near-twin in the checklist (repens vs. rubens) would be
+   needlessly flagged every single time. */
+const VOICE_EXACT_CONF = 0.97;
 const VOICE_MAX_RETRIES = 3;
+
+/* Everyday function words never occur in a Latin binomial, so their presence
+   marks an utterance as conversation rather than a species call. Used only to
+   gate the "record it as typed" fallback — a confident species match is always
+   kept, whatever else was said around it. */
+const CHATTER_WORDS = new Set(["a","an","the","and","or","but","if","is","it","its","this","that","these","those",
+  "you","your","we","our","us","i","me","my","he","she","they","them","to","of","in","on","at","for","with","from",
+  "by","not","no","yes","yeah","yep","nope","okay","ok","so","just","now","then","here","there","what","when","where",
+  "how","why","who","can","could","would","should","will","shall","do","does","did","done","have","has","had","be",
+  "been","was","were","am","are","get","got","go","going","gone","let","lets","next","last","stop","start","again",
+  "please","thanks","thank","sorry","hold","wait","see","look","think","know","say","said","up","down","out","over",
+  "very","really","much","more","most","some","any","all","one","two","three","right","left","back","over","about",
+  // filler / disfluency sounds a recognizer emits for throat-clearing and hesitation
+  "mm","hmm","hm","mhm","uh","um","uhm","er","erm","ah","eh","oh","huh","hey"]);
+function looksLikeSpeciesName(text) {
+  const words = (text || "").toLowerCase().replace(/[^a-zà-ÿ\s.-]/g, " ").split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 4) return false;
+  if (words.some(w => CHATTER_WORDS.has(w.replace(/\.$/, "")))) return false;
+  // Every real taxon name has at least one substantial word (shortest genus in
+  // the checklist is 3 letters, but those match the checklist directly and never
+  // reach this fallback) — so a string of tiny tokens is noise, not a name.
+  return words.some(w => w.replace(/\.$/, "").length >= 4);
+}
 
 // Records via WhisperVoice, transcribes, narrows candidates with the same
 // text fuzzy-matcher used for Web Speech results, then rescores that
@@ -1292,7 +1326,7 @@ function wireDictation(btn, inputEl, menuEl, statusEl, onPick) {
     const top = matches[0];
     const second = matches[1];
 
-    if (top && top.score >= VOICE_HIGH_CONF && (!second || top.score - second.score >= 0.12)) {
+    if (top && (top.score >= VOICE_EXACT_CONF || (top.score >= VOICE_HIGH_CONF && (!second || top.score - second.score >= 0.12)))) {
       inputEl.value = top.sp.t;
       inputEl.dispatchEvent(new Event("input"));
       inputEl.focus();
@@ -1381,6 +1415,7 @@ async function handleAiVoiceSegment(blob, addSpecies, setStatus, speakFeedback) 
     const { transcript, hypotheses, encoderHandle } = await AiVoice.mod.transcribeAudio(pcm);
     const heard = (transcript || "").trim();
     if (heard.length < 3) return; // breath/noise while walking — not worth interrupting for
+    if (!looksLikeSpeciesName(heard)) return; // conversation, not a species call
 
     // Shortlist kept smaller here (vs. dictation's larger list) because each
     // candidate costs its own decoder pass and this runs mid-walk where
@@ -1544,6 +1579,10 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
       // A few characters is more likely a stray noise/breath than an
       // attempted name — not worth recording or interrupting for.
       if (heard.length < 4) return;
+      // Nothing in the checklist came close AND it reads like ordinary talk
+      // ("did you write that down") rather than a name — that's a conversation
+      // picked up mid-walk, so stay quiet instead of logging junk to review.
+      if (!looksLikeSpeciesName(heard)) return;
       // Otherwise trust that a real (if unlisted) species was said —
       // record it as typed rather than fighting the speaker; it's
       // flagged for review same as any other low-confidence entry.
@@ -1565,7 +1604,8 @@ function wireVoiceLogging(btn, statusEl, viewName, addSpecies) {
     const addedNames = [], unsureNames = [];
     let lastCheckpoint = null;
     for (const seg of usable) {
-      const confident = seg.score >= VOICE_HIGH_CONF && (seg.score - (seg.second || 0) >= 0.12);
+      const confident = seg.score >= VOICE_EXACT_CONF
+        || (seg.score >= VOICE_HIGH_CONF && (seg.score - (seg.second || 0) >= 0.12));
       const result = await addSpecies(seg.sp, { unconfirmed: !confident, score: seg.score, silent: true });
       if (!result || result.added === false) continue;
       (confident ? addedNames : unsureNames).push(seg.sp.t);

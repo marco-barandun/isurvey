@@ -868,8 +868,15 @@ function tokenize(text) {
       full letter sequence ignores where those spurious word breaks
       landed, so it stays accurate exactly when strategy 1 breaks
       down. */
-function scoreTaxonAgainstWords(sp, words, phon) {
+function scoreTaxonAgainstWords(sp, words, phon, qConcat, qConcatPhon) {
   ensureSpeciesIndexed(sp);
+  // The whole-string blob of the query is identical for every taxon a given
+  // window/phrase is scored against, so callers in hot loops (the segmenter's
+  // DP, fuzzyMatchTranscripts) precompute it once and pass it in; fall back to
+  // computing it here for any caller that doesn't.
+  const concat = qConcat !== undefined ? qConcat : words.join("");
+  const concatPhon = qConcatPhon !== undefined ? qConcatPhon : phoneticCode(concat);
+
   let wi = 0, total = 0;
   const matchedTaxonIdx = new Set();
   for (let i = 0; i < words.length; i++) {
@@ -890,8 +897,6 @@ function scoreTaxonAgainstWords(sp, words, phon) {
   }
   const wordAlignScore = (total / words.length) * Math.max(0.5, 1 - 0.06 * unmatchedTaxonWords);
 
-  const concat = words.join("");
-  const concatPhon = phoneticCode(concat);
   const charSim = strSim(concat, sp._concat);
   const phonSim = strSim(concatPhon, sp._concatPhon);
   const lenDiff = Math.abs(concat.length - sp._concat.length) / Math.max(concat.length, sp._concat.length, 1);
@@ -899,6 +904,59 @@ function scoreTaxonAgainstWords(sp, words, phon) {
   const wholeScore = (charSim * 0.5 + phonSim * 0.5) * lenPenalty;
 
   return Math.max(wordAlignScore, wholeScore);
+}
+
+/* Candidate-narrowing index for the hot matching loops: taxa bucketed by the
+   possible first *sounds* of their genus, so a window is scored against just
+   the relevant buckets (~a few hundred taxa) instead of all ~4200.
+
+   The onset is deliberately fuzzy because the very first sound is where
+   recognizers and accents diverge most: soft vs. hard C (Cynosurus heard
+   "kynosurus"), silent K (Knautia heard "nautia"), silent G/P (Gnaphalium,
+   Psilurus), x→"s", w→"v", y→"i". Each genus is filed under *every* plausible
+   onset key, and a query is looked up under its own onset keys — as long as
+   the two sets intersect the true genus is found, so the pruning stays lossless
+   on the accent battery while keeping the buckets small. */
+function onsetKeys(word) {
+  const w = (word || "").toLowerCase();
+  const keys = new Set();
+  if (!w) return keys;
+  const p = phoneticCode(w);
+  if (p) keys.add(p[0]);
+  const a = w[0], b = w[1];
+  keys.add(a);
+  if (a === "c") { keys.add("k"); keys.add("s"); }           // soft/hard C
+  if (a === "k") { keys.add("k"); if (b === "n") keys.add("n"); } // silent K (knautia)
+  if (a === "g" && b === "n") keys.add("n");                  // silent G (gnaphalium)
+  if (a === "p" && (b === "s" || b === "t")) keys.add("s");   // silent P (psilurus, ptelea)
+  if (a === "x") keys.add("s");
+  if (a === "w") { keys.add("v"); keys.add("f"); }
+  if (a === "y") keys.add("i");
+  if (a === "z") keys.add("s");
+  if (a === "h") keys.add("");                                 // silent/aspirated H
+  return keys;
+}
+function genusPhonBuckets() {
+  if (Species._genusBuckets) return Species._genusBuckets;
+  const m = new Map();
+  for (const sp of Species.all) {
+    ensureSpeciesIndexed(sp);
+    for (const k of onsetKeys(sp._words[0])) {
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(sp);
+    }
+  }
+  Species._genusBuckets = m;
+  return m;
+}
+// Union of the buckets a query's first spoken word could plausibly point at.
+function genusCandidates(firstWord) {
+  const buckets = genusPhonBuckets();
+  const keys = onsetKeys(firstWord);
+  if (keys.size <= 1) { const k = [...keys][0] || ""; return buckets.get(k) || []; }
+  const seen = new Set();
+  for (const k of keys) { const b = buckets.get(k); if (b) for (const sp of b) seen.add(sp); }
+  return [...seen];
 }
 
 /* Best (and second-best) taxon for one specific word window, used
@@ -914,10 +972,16 @@ function scoreTaxonAgainstWords(sp, words, phon) {
    looking partial pieces, since each fragment can cheaply find some
    same-genus species to match against. */
 function bestTaxaForWords(words, phon) {
+  // Precompute the query blob once for the whole window (not per taxon).
+  const qConcat = words.join("");
+  const qConcatPhon = phoneticCode(qConcat);
+  // Only taxa whose genus could start with the window's first spoken word are
+  // scored. A window whose first sound matches no genus (junk/filler) yields no
+  // candidates and correctly contributes no segment.
+  const candidates = genusCandidates(words[0]);
   let best = null, second = null;
-  for (const sp of Species.all) {
-    ensureSpeciesIndexed(sp);
-    const raw = scoreTaxonAgainstWords(sp, words, phon);
+  for (const sp of candidates) {
+    const raw = scoreTaxonAgainstWords(sp, words, phon, qConcat, qConcatPhon);
     // Coverage is measured against the taxon's core (non-rank-marker)
     // word count, so omitting "subsp."/"var."/etc. isn't treated as
     // an incomplete match the way skipping a real name word would be.
@@ -937,12 +1001,21 @@ function fuzzyMatchTranscripts(transcripts, limit) {
   limit = limit || 6;
   const qSets = transcripts.map(tokenize).filter(q => q.words.length);
   if (!qSets.length) return [];
+  // Precompute each query's whole-string blob once, and gather the genus
+  // buckets its first sound points at, so only plausible taxa are scored
+  // instead of the whole checklist.
+  const candidates = new Set();
+  for (const q of qSets) {
+    q.concat = q.words.join("");
+    q.concatPhon = phoneticCode(q.concat);
+    for (const sp of genusCandidates(q.words[0])) candidates.add(sp);
+  }
 
   const scored = [];
-  for (const sp of Species.all) {
+  for (const sp of candidates) {
     let best = 0;
     for (const q of qSets) {
-      const score = scoreTaxonAgainstWords(sp, q.words, q.phon);
+      const score = scoreTaxonAgainstWords(sp, q.words, q.phon, q.concat, q.concatPhon);
       if (score > best) best = score;
     }
     if (best > 0.15) {
